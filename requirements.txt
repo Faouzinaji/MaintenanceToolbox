@@ -1,0 +1,6 @@
+streamlit>=1.40
+pandas>=2.2
+plotly>=5.24
+SQLAlchemy>=2.0
+psycopg[binary]>=3.2
+python-dotenv>=1.0
