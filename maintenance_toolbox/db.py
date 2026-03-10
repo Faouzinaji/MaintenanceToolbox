@@ -249,21 +249,36 @@ def init_db() -> None:
             session.commit()
 
 
-def ensure_org_defaults(session: Session, org: Organization) -> None:
-    mapping = session.scalar(select(FieldMapping).where(FieldMapping.organization_id == org.id))
-    if mapping is None:
-        mapping = FieldMapping(organization_id=org.id)
-        session.add(mapping)
-    existing = session.scalars(select(RexCause).where(RexCause.organization_id == org.id)).all()
-    if not existing:
-        for fr, en, nl in DEFAULT_CAUSES:
-            session.add(RexCause(
-                organization_id=org.id,
-                label_fr=fr,
-                label_en=en,
-                label_nl=nl,
-                active=True,
-            ))
+from sqlalchemy import select
+
+def ensure_org_defaults(session, org):
+    # Si l'org est None ou n'a pas d'id, on ne fait rien
+    if org is None or getattr(org, "id", None) is None:
+        return
+
+    # Cherche un mapping existant pour l'organisation
+    mapping = session.execute(
+        select(FieldMapping).where(FieldMapping.organization_id == org.id)
+    ).scalar_one_or_none()
+
+    # S'il existe déjà, on sort
+    if mapping:
+        return
+
+    # Sinon on crée un mapping par défaut
+    mapping = FieldMapping(
+        organization_id=org.id,
+        ot_id="OT",
+        description="Description",
+        equipment="Equipement",
+        status="Statut OT",
+        created_by="Cree par",
+        created_on="Date OT",
+        desired_week="Semaine souhaitée",
+        condition="Cond Real",
+        estimated_hours="Duree estimee"
+    )
+    session.add(mapping)
     session.commit()
 
 
