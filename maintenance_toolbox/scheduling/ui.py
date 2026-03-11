@@ -1,11 +1,12 @@
 from datetime import datetime, time, timezone
+import csv
 import io
 
 import pandas as pd
 import streamlit as st
 from sqlalchemy import select
 
-from maintenance_toolbox.db import Planning
+from maintenance_toolbox.db import Planning, FieldMapping
 
 
 def _combine_date_time(d, hhmm: str):
@@ -14,28 +15,74 @@ def _combine_date_time(d, hhmm: str):
 
 
 def _read_csv_safely(file_bytes: bytes) -> pd.DataFrame:
-    candidates = [
-        {"sep": ";", "encoding": "utf-8"},
-        {"sep": ";", "encoding": "latin-1"},
-        {"sep": ",", "encoding": "utf-8"},
-        {"sep": ",", "encoding": "latin-1"},
-        {"sep": "\t", "encoding": "utf-8"},
-        {"sep": "\t", "encoding": "latin-1"},
-    ]
-
+    raw_text = None
     last_error = None
-    for c in candidates:
+
+    for encoding in ["utf-8-sig", "utf-8", "latin-1", "cp1252"]:
         try:
-            return pd.read_csv(
-                io.BytesIO(file_bytes),
-                sep=c["sep"],
-                encoding=c["encoding"],
-                low_memory=False,
-            )
+            raw_text = file_bytes.decode(encoding)
+            break
         except Exception as e:
             last_error = e
 
-    raise ValueError(f"Impossible de lire le CSV : {last_error}")
+    if raw_text is None:
+        raise ValueError(f"Impossible de décoder le fichier : {last_error}")
+
+    sample = raw_text[:5000]
+
+    delimiters = [",", ";", "\t", "|"]
+    detected_sep = None
+
+    try:
+        dialect = csv.Sniffer().sniff(sample, delimiters=delimiters)
+        detected_sep = dialect.delimiter
+    except Exception:
+        pass
+
+    candidates = []
+    if detected_sep:
+        candidates.append(detected_sep)
+
+    for sep in delimiters:
+        if sep not in candidates:
+            candidates.append(sep)
+
+    best_df = None
+    best_score = -1
+    best_sep = None
+    best_error = None
+
+    for sep in candidates:
+        try:
+            df = pd.read_csv(
+                io.StringIO(raw_text),
+                sep=sep,
+                engine="python",
+                low_memory=False,
+            )
+
+            score = len(df.columns)
+
+            if len(df.columns) == 1:
+                first_col = str(df.columns[0])
+                if "," in first_col or ";" in first_col or "\t" in first_col:
+                    score = 0
+
+            if score > best_score:
+                best_score = score
+                best_df = df
+                best_sep = sep
+
+        except Exception as e:
+            best_error = e
+
+    if best_df is None:
+        raise ValueError(f"Impossible de lire le CSV : {best_error}")
+
+    if best_score <= 0:
+        raise ValueError("Le fichier a été lu sur une seule colonne. Le séparateur n'a pas été correctement détecté.")
+
+    return best_df
 
 
 def _get_current_planning(session, planning_id):
@@ -61,6 +108,54 @@ def _reset_wizard():
     st.session_state["wizard_active_section"] = 1
     st.session_state["wizard_csv_columns"] = []
     st.session_state["wizard_mapping"] = {}
+
+
+def _load_saved_mapping(session, organization_id):
+    fm = session.scalar(
+        select(FieldMapping).where(FieldMapping.organization_id == organization_id)
+    )
+    if not fm:
+        return {}
+
+    return {
+        "ot_id": fm.ot_id_col or "",
+        "description": fm.description_col or "",
+        "status": fm.status_col or "",
+        "atelier": fm.atelier_col or "",
+        "secteur": fm.secteur_col or "",
+        "equipment": fm.equipment_col or "",
+        "equipment_desc": fm.equipment_desc_col or "",
+        "created_at": fm.created_at_col or "",
+        "created_by": fm.created_by_col or "",
+        "requested_week": fm.requested_week_col or "",
+        "condition": fm.condition_col or "",
+        "estimated_hours": fm.estimated_hours_col or "",
+    }
+
+
+def _save_mapping(session, organization_id, mapping):
+    fm = session.scalar(
+        select(FieldMapping).where(FieldMapping.organization_id == organization_id)
+    )
+
+    if not fm:
+        fm = FieldMapping(organization_id=organization_id)
+        session.add(fm)
+
+    fm.ot_id_col = mapping.get("ot_id") or None
+    fm.description_col = mapping.get("description") or None
+    fm.status_col = mapping.get("status") or None
+    fm.atelier_col = mapping.get("atelier") or None
+    fm.secteur_col = mapping.get("secteur") or None
+    fm.equipment_col = mapping.get("equipment") or None
+    fm.equipment_desc_col = mapping.get("equipment_desc") or None
+    fm.created_at_col = mapping.get("created_at") or None
+    fm.created_by_col = mapping.get("created_by") or None
+    fm.requested_week_col = mapping.get("requested_week") or None
+    fm.condition_col = mapping.get("condition") or None
+    fm.estimated_hours_col = mapping.get("estimated_hours") or None
+
+    session.commit()
 
 
 def render_scheduling_module(session, user):
@@ -129,9 +224,6 @@ def render_scheduling_module(session, user):
                 f"Période : **{planning.start_at} → {planning.end_at}**"
             )
 
-        # =========================================================
-        # 1. PARAMÈTRES
-        # =========================================================
         with st.expander(
             "1. Paramètres de l'arrêt",
             expanded=st.session_state["wizard_active_section"] == 1,
@@ -195,9 +287,6 @@ def render_scheduling_module(session, user):
         if not planning:
             return
 
-        # =========================================================
-        # 2. IMPORT CSV
-        # =========================================================
         with st.expander(
             "2. Import CSV",
             expanded=st.session_state["wizard_active_section"] == 2,
@@ -256,9 +345,6 @@ def render_scheduling_module(session, user):
                 except Exception as e:
                     st.error(f"Erreur de lecture du CSV enregistré : {e}")
 
-        # =========================================================
-        # 3. MAPPING
-        # =========================================================
         with st.expander(
             "3. Mapping colonnes",
             expanded=st.session_state["wizard_active_section"] == 3,
@@ -272,26 +358,26 @@ def render_scheduling_module(session, user):
 
                     st.write("Associe les colonnes du fichier aux champs standard.")
 
-                    current_mapping = st.session_state.get("wizard_mapping", {})
+                    saved_mapping = _load_saved_mapping(session, user.organization_id)
+                    current_mapping = st.session_state.get("wizard_mapping", {}) or saved_mapping
+
+                    targets = [
+                        ("ot_id", "OT"),
+                        ("description", "Description"),
+                        ("status", "Statut"),
+                        ("atelier", "Atelier"),
+                        ("secteur", "Secteur"),
+                        ("equipment", "Equipement"),
+                        ("equipment_desc", "Description équipement"),
+                        ("created_at", "Créé le"),
+                        ("created_by", "Créé par"),
+                        ("requested_week", "Sem. souhaitée"),
+                        ("condition", "Condition réalisation"),
+                        ("estimated_hours", "Durée estimée"),
+                    ]
 
                     with st.form("mapping_form"):
                         mapping = {}
-
-                        targets = [
-                            ("ot_id", "OT"),
-                            ("description", "Description"),
-                            ("status", "Statut"),
-                            ("atelier", "Atelier"),
-                            ("secteur", "Secteur"),
-                            ("equipment", "Equipement"),
-                            ("equipment_desc", "Description équipement"),
-                            ("created_at", "Créé le"),
-                            ("created_by", "Créé par"),
-                            ("requested_week", "Sem. souhaitée"),
-                            ("condition", "Condition réalisation"),
-                            ("estimated_hours", "Durée estimée"),
-                        ]
-
                         options = [""] + columns
 
                         for key, label in targets:
@@ -314,16 +400,14 @@ def render_scheduling_module(session, user):
                             st.error("Au minimum, mappe OT, Description et Atelier.")
                         else:
                             st.session_state["wizard_mapping"] = mapping
+                            _save_mapping(session, user.organization_id, mapping)
                             st.session_state["wizard_active_section"] = 4
-                            st.success("Mapping validé.")
+                            st.success("Mapping validé et sauvegardé.")
                             st.rerun()
 
                 except Exception as e:
                     st.error(f"Erreur lors du mapping : {e}")
 
-        # =========================================================
-        # 4. SÉLECTION OT
-        # =========================================================
         with st.expander(
             "4. Sélection des OT",
             expanded=st.session_state["wizard_active_section"] == 4,
