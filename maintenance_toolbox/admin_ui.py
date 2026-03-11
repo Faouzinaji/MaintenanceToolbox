@@ -1,6 +1,7 @@
 import streamlit as st
 from sqlalchemy import select
-from maintenance_toolbox.db import User, Organization
+
+from maintenance_toolbox.db import User, Organization, ensure_org_defaults
 
 
 def render_admin(session, current_user):
@@ -15,7 +16,9 @@ def render_admin(session, current_user):
     with tab1:
         st.subheader("Créer un utilisateur")
 
-        organizations = session.scalars(select(Organization).order_by(Organization.name)).all()
+        organizations = session.scalars(
+            select(Organization).order_by(Organization.name)
+        ).all()
         org_options = {org.name: org.id for org in organizations}
 
         with st.form("create_user_form"):
@@ -23,10 +26,16 @@ def render_admin(session, current_user):
             email = st.text_input("Email")
             password = st.text_input("Mot de passe temporaire", type="password")
             role = st.selectbox("Rôle", ["user", "admin"])
-            org_name = st.selectbox("Organisation", list(org_options.keys()) if org_options else [])
+            org_name = st.selectbox(
+                "Organisation",
+                list(org_options.keys()) if org_options else []
+            )
             is_active = st.checkbox("Actif", value=True)
 
-            submitted = st.form_submit_button("Créer l'utilisateur", use_container_width=True)
+            submitted = st.form_submit_button(
+                "Créer l'utilisateur",
+                use_container_width=True
+            )
 
         if submitted:
             existing = session.scalar(select(User).where(User.email == email))
@@ -65,16 +74,23 @@ def render_admin(session, current_user):
         with st.form("create_org_form"):
             org_name = st.text_input("Nom organisation")
             timezone = st.text_input("Timezone", value="Europe/Paris")
-            submitted_org = st.form_submit_button("Créer l'organisation", use_container_width=True)
+            submitted_org = st.form_submit_button(
+                "Créer l'organisation",
+                use_container_width=True
+            )
 
         if submitted_org:
-            existing_org = session.scalar(select(Organization).where(Organization.name == org_name))
+            existing_org = session.scalar(
+                select(Organization).where(Organization.name == org_name)
+            )
             if existing_org:
                 st.error("Cette organisation existe déjà")
             else:
                 org = Organization(name=org_name, timezone=timezone, active=True)
                 session.add(org)
                 session.commit()
+                session.refresh(org)
+                ensure_org_defaults(session, org)
                 st.success("Organisation créée")
 
         st.divider()
