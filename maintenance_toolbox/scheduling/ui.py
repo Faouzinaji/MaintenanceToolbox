@@ -15,39 +15,47 @@ def _combine_date_time(d, hhmm: str):
 def render_scheduling_module(session, user):
     st.title("Scheduling")
 
+    if not user.organization_id:
+        st.warning("Aucune organisation n'est associée à cet utilisateur.")
+        return
+
     tab1, tab2 = st.tabs(["Mes plannings", "Créer un planning"])
 
     with tab1:
         st.subheader("Mes plannings")
 
-        stmt = (
-            select(Planning)
-            .where(Planning.organization_id == user.organization_id)
-            .order_by(Planning.created_at.desc())
-        )
-        plannings = session.scalars(stmt).all()
+        try:
+            stmt = (
+                select(Planning)
+                .where(Planning.organization_id == user.organization_id)
+                .order_by(Planning.created_at.desc())
+            )
+            plannings = session.scalars(stmt).all()
 
-        if not plannings:
-            st.info("Aucun planning pour le moment.")
-        else:
-            rows = []
-            for p in plannings:
-                rows.append(
-                    {
-                        "ID": p.id,
-                        "Nom": p.name,
-                        "Statut": p.status,
-                        "Début": p.start_at,
-                        "Fin": p.end_at,
-                        "Ouverture": p.daily_open,
-                        "Fermeture": p.daily_close,
-                        "Secteurs": p.sectors_csv,
-                        "Créé le": p.created_at,
-                    }
-                )
+            if not plannings:
+                st.info("Aucun planning pour le moment.")
+            else:
+                rows = []
+                for p in plannings:
+                    rows.append(
+                        {
+                            "ID": p.id,
+                            "Nom": p.name,
+                            "Statut": p.status,
+                            "Début": p.start_at,
+                            "Fin": p.end_at,
+                            "Ouverture": p.daily_open,
+                            "Fermeture": p.daily_close,
+                            "Secteurs": p.sectors_csv,
+                            "Créé le": p.created_at,
+                        }
+                    )
 
-            df = pd.DataFrame(rows)
-            st.dataframe(df, use_container_width=True, hide_index=True)
+                df = pd.DataFrame(rows)
+                st.dataframe(df, use_container_width=True, hide_index=True)
+
+        except Exception as e:
+            st.error(f"Erreur lors du chargement des plannings : {e}")
 
     with tab2:
         st.subheader("Créer un planning")
@@ -55,10 +63,13 @@ def render_scheduling_module(session, user):
         with st.form("create_planning_form"):
             name = st.text_input("Nom du planning")
             sectors_txt = st.text_input("Secteurs (séparés par des virgules)")
+
             col1, col2 = st.columns(2)
+
             with col1:
                 start_date = st.date_input("Date de début")
                 daily_open = st.text_input("Heure d'ouverture", value="07:00")
+
             with col2:
                 end_date = st.date_input("Date de fin")
                 daily_close = st.text_input("Heure de fermeture", value="15:00")
