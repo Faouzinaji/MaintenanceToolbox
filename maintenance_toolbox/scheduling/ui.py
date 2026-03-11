@@ -58,7 +58,6 @@ def _read_csv_safely(file_bytes: bytes) -> pd.DataFrame:
                 io.StringIO(raw_text),
                 sep=sep,
                 engine="python",
-                low_memory=False,
             )
 
             score = len(df.columns)
