@@ -38,8 +38,9 @@ class Organization(Base):
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
     )
 
-    users: Mapped[list["User"]] = relationship(back_populates="organization")
-    plannings: Mapped[list["Planning"]] = relationship(back_populates="organization")
+users: Mapped[list["User"]] = relationship(back_populates="organization")
+plannings: Mapped[list["Planning"]] = relationship(back_populates="organization")
+mappings: Mapped[list["FieldMapping"]] = relationship()
 
 
 class User(Base):
@@ -68,6 +69,26 @@ class User(Base):
     def check_password(self, password: str) -> bool:
         return check_password_hash(self.password_hash, password)
 
+class FieldMapping(Base):
+    __tablename__ = "field_mappings"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    organization_id: Mapped[int] = mapped_column(
+        ForeignKey("organizations.id"), unique=True, index=True
+    )
+
+    ot_id_col: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    description_col: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    status_col: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    atelier_col: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    secteur_col: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    equipment_col: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    equipment_desc_col: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    created_at_col: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    created_by_col: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    requested_week_col: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    condition_col: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    estimated_hours_col: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
 
 class Planning(Base):
     __tablename__ = "plannings"
