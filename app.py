@@ -1,9 +1,11 @@
 import streamlit as st
+
 from maintenance_toolbox.db import init_db, SessionLocal
-from maintenance_toolbox.home import render_home
-from maintenance_toolbox.scheduling.ui import render_scheduling_module
 from maintenance_toolbox.auth import render_login, get_current_user, logout_user
+from maintenance_toolbox.home import render_home
 from maintenance_toolbox.admin_ui import render_admin
+from maintenance_toolbox.scheduling.ui import render_scheduling_module
+
 
 st.set_page_config(page_title="MaintenanceToolbox", layout="wide")
 
@@ -44,7 +46,7 @@ with SessionLocal() as session:
     page = st.session_state["page"]
 
     if page == "home":
-        render_home()
+        render_home(user)
     elif page == "scheduling":
         render_scheduling_module(session, user)
     elif page == "admin":
