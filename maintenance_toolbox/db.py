@@ -9,6 +9,7 @@ from sqlalchemy import (
     DateTime,
     ForeignKey,
     Integer,
+    LargeBinary,
     String,
     Text,
     create_engine,
@@ -81,9 +82,19 @@ class Planning(Base):
     daily_open: Mapped[str] = mapped_column(String(5), default="07:00")
     daily_close: Mapped[str] = mapped_column(String(5), default="15:00")
     status: Mapped[str] = mapped_column(String(32), default="draft")
+    csv_filename: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    csv_bytes: Mapped[Optional[bytes]] = mapped_column(LargeBinary, nullable=True)
+    window_real_start: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    window_real_end: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
     )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )
+    archived: Mapped[bool] = mapped_column(Boolean, default=False)
 
     organization: Mapped[Organization] = relationship(back_populates="plannings")
 
