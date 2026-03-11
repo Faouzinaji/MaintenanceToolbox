@@ -38,9 +38,9 @@ class Organization(Base):
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
     )
 
-users: Mapped[list["User"]] = relationship(back_populates="organization")
-plannings: Mapped[list["Planning"]] = relationship(back_populates="organization")
-mappings: Mapped[list["FieldMapping"]] = relationship()
+    users: Mapped[list["User"]] = relationship(back_populates="organization")
+    plannings: Mapped[list["Planning"]] = relationship(back_populates="organization")
+    mappings: Mapped[list["FieldMapping"]] = relationship()
 
 
 class User(Base):
@@ -69,6 +69,7 @@ class User(Base):
     def check_password(self, password: str) -> bool:
         return check_password_hash(self.password_hash, password)
 
+
 class FieldMapping(Base):
     __tablename__ = "field_mappings"
 
@@ -89,6 +90,7 @@ class FieldMapping(Base):
     requested_week_col: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     condition_col: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     estimated_hours_col: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+
 
 class Planning(Base):
     __tablename__ = "plannings"
@@ -143,9 +145,15 @@ def init_db() -> None:
     Base.metadata.create_all(bind=engine)
 
     with SessionLocal() as session:
-        org = session.scalar(select(Organization).where(Organization.name == "Default Organization"))
+        org = session.scalar(
+            select(Organization).where(Organization.name == "Default Organization")
+        )
         if not org:
-            org = Organization(name="Default Organization", timezone="Europe/Paris", active=True)
+            org = Organization(
+                name="Default Organization",
+                timezone="Europe/Paris",
+                active=True,
+            )
             session.add(org)
             session.commit()
             session.refresh(org)
