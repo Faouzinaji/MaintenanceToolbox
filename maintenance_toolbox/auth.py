@@ -1,5 +1,6 @@
 import streamlit as st
 from sqlalchemy import select
+
 from maintenance_toolbox.db import User
 
 
@@ -18,10 +19,8 @@ def login_user(user):
 
 
 def logout_user():
-    keys = ["user_id", "user_role", "user_name", "user_org_id", "page"]
-    for key in keys:
-        if key in st.session_state:
-            del st.session_state[key]
+    for key in list(st.session_state.keys()):
+        del st.session_state[key]
 
 
 def render_login(session):
