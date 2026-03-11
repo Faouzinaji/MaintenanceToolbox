@@ -5,23 +5,29 @@ from maintenance_toolbox.scheduling.ui import render_scheduling_module
 
 st.set_page_config(page_title="MaintenanceToolbox", layout="wide")
 
-init_db()
+try:
+    init_db()
+except Exception as e:
+    st.error(f"Erreur lors de l'initialisation de la base de données : {e}")
+    st.stop()
 
 if "page" not in st.session_state:
     st.session_state["page"] = "home"
 
-with SessionLocal() as session:
+try:
+    with SessionLocal() as session:
+        st.sidebar.title("MaintenanceToolbox")
 
-    st.sidebar.title("MaintenanceToolbox")
+        if st.sidebar.button("Accueil", use_container_width=True):
+            st.session_state["page"] = "home"
 
-    if st.sidebar.button("Accueil", use_container_width=True):
-        st.session_state["page"] = "home"
+        if st.sidebar.button("Scheduling", use_container_width=True):
+            st.session_state["page"] = "scheduling"
 
-    if st.sidebar.button("Scheduling", use_container_width=True):
-        st.session_state["page"] = "scheduling"
+        if st.session_state["page"] == "home":
+            render_home()
+        elif st.session_state["page"] == "scheduling":
+            render_scheduling_module(session)
 
-    if st.session_state["page"] == "home":
-        render_home()
-
-    if st.session_state["page"] == "scheduling":
-        render_scheduling_module(session)
+except Exception as e:
+    st.error(f"Erreur application : {e}")
