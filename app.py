@@ -46,6 +46,6 @@ with SessionLocal() as session:
     if page == "home":
         render_home()
     elif page == "scheduling":
-        render_scheduling_module(session)
+        render_scheduling_module(session, user)
     elif page == "admin":
         render_admin(session, user)
