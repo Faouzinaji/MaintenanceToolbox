@@ -1,7 +1,6 @@
 import streamlit as st
 
 def render_home():
-
     st.title("MaintenanceToolbox")
     st.subheader("Industrial Maintenance Platform")
 
@@ -12,7 +11,7 @@ def render_home():
             st.session_state["page"] = "scheduling"
 
     with col2:
-        st.button("🧠 Reliability / RCA (coming soon)", disabled=True)
+        st.button("🧠 Reliability / RCA (coming soon)", disabled=True, use_container_width=True)
 
     with col3:
-        st.button("📦 Stock / ABC (coming soon)", disabled=True)
+        st.button("📦 Stock / ABC (coming soon)", disabled=True, use_container_width=True)
