@@ -1,6 +1,7 @@
 import streamlit as st
 
-def render_home():
+
+def render_home(user):
     st.title("MaintenanceToolbox")
     st.subheader("Industrial Maintenance Platform")
 
@@ -15,3 +16,6 @@ def render_home():
 
     with col3:
         st.button("📦 Stock / ABC (coming soon)", disabled=True, use_container_width=True)
+
+    st.divider()
+    st.write(f"Bienvenue **{user.full_name}**.")
