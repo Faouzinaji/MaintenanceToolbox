@@ -10,6 +10,7 @@ from sqlalchemy import (
     ForeignKey,
     Integer,
     String,
+    Text,
     create_engine,
     select,
 )
@@ -37,6 +38,7 @@ class Organization(Base):
     )
 
     users: Mapped[list["User"]] = relationship(back_populates="organization")
+    plannings: Mapped[list["Planning"]] = relationship(back_populates="organization")
 
 
 class User(Base):
@@ -70,10 +72,20 @@ class Planning(Base):
     __tablename__ = "plannings"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    organization_id: Mapped[int] = mapped_column(ForeignKey("organizations.id"), index=True)
+    created_by_user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
     name: Mapped[str] = mapped_column(String(255), index=True)
+    sectors_csv: Mapped[str] = mapped_column(Text, default="")
+    start_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    end_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    daily_open: Mapped[str] = mapped_column(String(5), default="07:00")
+    daily_close: Mapped[str] = mapped_column(String(5), default="15:00")
+    status: Mapped[str] = mapped_column(String(32), default="draft")
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
     )
+
+    organization: Mapped[Organization] = relationship(back_populates="plannings")
 
 
 def get_database_url() -> str:
@@ -99,16 +111,15 @@ def init_db() -> None:
     Base.metadata.create_all(bind=engine)
 
     with SessionLocal() as session:
+        org = session.scalar(select(Organization).where(Organization.name == "Default Organization"))
+        if not org:
+            org = Organization(name="Default Organization", timezone="Europe/Paris", active=True)
+            session.add(org)
+            session.commit()
+            session.refresh(org)
+
         admin = session.scalar(select(User).where(User.email == DEFAULT_ADMIN_EMAIL))
         if not admin:
-            # create default organization
-            org = session.scalar(select(Organization).where(Organization.name == "Default Organization"))
-            if not org:
-                org = Organization(name="Default Organization", timezone="Europe/Paris", active=True)
-                session.add(org)
-                session.commit()
-                session.refresh(org)
-
             admin = User(
                 email=DEFAULT_ADMIN_EMAIL,
                 full_name="Global Admin",
