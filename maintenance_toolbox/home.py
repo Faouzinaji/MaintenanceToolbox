@@ -10,6 +10,6 @@ def render_home(user):
 
     col1, col2, col3 = st.columns([2, 3, 2])
     with col2:
-        if st.button("📅 Scheduling", use_container_width=True):
+        if st.button("📅 Scheduling", key="home_scheduling", use_container_width=True):
             st.session_state["page"] = "scheduling"
             st.rerun()
