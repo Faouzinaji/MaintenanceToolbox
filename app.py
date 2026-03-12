@@ -5,6 +5,7 @@ from maintenance_toolbox.auth import render_login, get_current_user, logout_user
 from maintenance_toolbox.home import render_home
 from maintenance_toolbox.admin_ui import render_admin
 from maintenance_toolbox.scheduling.ui import render_scheduling_module
+from maintenance_toolbox.settings_ui import render_settings
 
 
 st.set_page_config(page_title="MaintenanceToolbox", layout="wide")
@@ -25,23 +26,29 @@ with SessionLocal() as session:
         render_login(session)
         st.stop()
 
-    st.sidebar.title("MaintenanceToolbox")
-    st.sidebar.write(f"Connecté : **{user.full_name}**")
-    st.sidebar.caption(user.email)
+    c1, c2, c3, c4, c5 = st.columns([1.2, 1.4, 1.2, 1.2, 8])
 
-    if st.sidebar.button("Accueil", use_container_width=True):
-        st.session_state["page"] = "home"
+    with c1:
+        if st.button("🏠 Accueil", use_container_width=True):
+            st.session_state["page"] = "home"
+            st.rerun()
 
-    if st.sidebar.button("Scheduling", use_container_width=True):
-        st.session_state["page"] = "scheduling"
+    with c2:
+        if st.button("📅 Scheduling", use_container_width=True):
+            st.session_state["page"] = "scheduling"
+            st.rerun()
 
-    if user.role == "admin":
-        if st.sidebar.button("Admin", use_container_width=True):
-            st.session_state["page"] = "admin"
+    with c3:
+        if st.button("⚙️ Settings", use_container_width=True):
+            st.session_state["page"] = "settings"
+            st.rerun()
 
-    if st.sidebar.button("Logout", use_container_width=True):
-        logout_user()
-        st.rerun()
+    with c4:
+        if st.button("🚪 Logout", use_container_width=True):
+            logout_user()
+            st.rerun()
+
+    st.divider()
 
     page = st.session_state["page"]
 
@@ -49,5 +56,7 @@ with SessionLocal() as session:
         render_home(user)
     elif page == "scheduling":
         render_scheduling_module(session, user)
+    elif page == "settings":
+        render_settings(session, user)
     elif page == "admin":
         render_admin(session, user)
