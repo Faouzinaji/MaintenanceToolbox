@@ -10,6 +10,57 @@ from maintenance_toolbox.settings_ui import render_settings
 
 st.set_page_config(page_title="MaintenanceToolbox", layout="wide")
 
+st.markdown(
+    """
+    <style>
+    :root {
+        --mn-orange: #f39200;
+        --mn-dark: #3f434f;
+        --mn-light: #f7f7f7;
+        --mn-soft: #ead7b0;
+    }
+
+    .stApp {
+        background-color: white;
+    }
+
+    h1, h2, h3 {
+        color: var(--mn-dark);
+    }
+
+    .stButton > button {
+        border-radius: 10px;
+        border: 1px solid #d9d9d9;
+    }
+
+    .stButton > button[kind="primary"] {
+        background-color: var(--mn-orange);
+        color: white;
+        border: 1px solid var(--mn-orange);
+    }
+
+    div[data-testid="stMetricValue"] {
+        color: var(--mn-dark);
+    }
+
+    div[data-testid="stExpander"] details summary {
+        color: var(--mn-dark);
+        font-weight: 600;
+    }
+
+    .mn-banner {
+        background: #f8f3e8;
+        border-left: 6px solid var(--mn-orange);
+        padding: 12px 16px;
+        border-radius: 8px;
+        color: var(--mn-dark);
+        margin-bottom: 12px;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 try:
     init_db()
 except Exception as e:
