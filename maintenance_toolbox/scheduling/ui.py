@@ -294,7 +294,7 @@ def _delete_planning(session, planning_id):
 
 
 # =========================================================
-# DATA BUILDERS
+# BUILDERS
 # =========================================================
 
 def _build_tasks_df_from_mapping(df, mapping):
@@ -705,80 +705,23 @@ def _persist_generation(session, planning, all_tasks_df, teams_df):
     session.refresh(planning)
 
 
-def _load_tasks_df_from_db(planning):
-    rows = []
-    for t in planning.tasks:
-        rows.append(
-            {
-                "ot_id": t.external_ot_id or "",
-                "description": t.description or "",
-                "status": t.source_status or "",
-                "atelier": t.atelier or "",
-                "secteur": t.secteur or "",
-                "equipment": t.equipment_code or "",
-                "equipment_desc": t.equipment_desc or "",
-                "created_at": t.created_at_source or "",
-                "created_by": t.created_by_source or "",
-                "requested_week": t.requested_week_source or "",
-                "condition": t.condition_source or "",
-                "estimated_hours": t.estimated_hours or 0.0,
-                "priority_score": _status_score(t.source_status or ""),
-                "selected": bool(t.selected),
-                "forced_team": t.forced_team_codes or "",
-                "predecessor_ot": t.predecessor_ot_id or "",
-                "forced_start": str(t.forced_start_at) if t.forced_start_at else "",
-                "duration_hours": t.estimated_hours or 0.0,
-                "selected_warning": t.selected_warning or "",
-                "planned_start_at": str(t.planned_start_at) if t.planned_start_at else "",
-                "planned_end_at": str(t.planned_end_at) if t.planned_end_at else "",
-                "planned_team_name": t.planned_team_name or "",
-                "commentaire": "",
-            }
-        )
-    return pd.DataFrame(rows)
-
-
-def _load_teams_df_from_db(planning):
-    rows = []
-    for t in planning.teams:
-        rows.append(
-            {
-                "atelier": t.atelier,
-                "code": t.code,
-                "name": t.name,
-                "available_from": t.available_from.strftime("%Y-%m-%d %H:%M") if t.available_from else "",
-                "available_to": t.available_to.strftime("%Y-%m-%d %H:%M") if t.available_to else "",
-            }
-        )
-    return pd.DataFrame(rows)
-
-
 def _load_planning_into_wizard(session, user, planning):
     st.session_state["scheduling_view"] = "Creer un planning"
     st.session_state["wizard_planning_id"] = planning.id
     st.session_state["wizard_mapping"] = _load_saved_mapping(session, user.organization_id)
-
-    if len(planning.tasks) > 0:
-        st.session_state["wizard_tasks_df"] = _load_tasks_df_from_db(planning)
-    else:
-        st.session_state["wizard_tasks_df"] = None
-
-    if len(planning.teams) > 0:
-        st.session_state["wizard_teams_df"] = _load_teams_df_from_db(planning)
-    else:
-        st.session_state["wizard_teams_df"] = None
-
+    st.session_state["wizard_tasks_df"] = None
     st.session_state["wizard_filtered_tasks_df"] = None
     st.session_state["wizard_selected_df"] = None
-    st.session_state["wizard_generated_df"] = None
-    st.session_state["wizard_unscheduled_df"] = None
+    st.session_state["wizard_teams_df"] = None
     st.session_state["wizard_team_counts"] = {}
     st.session_state["wizard_selected_ateliers"] = []
     st.session_state["wizard_selected_secteurs"] = []
+    st.session_state["wizard_generated_df"] = None
+    st.session_state["wizard_unscheduled_df"] = None
     st.session_state["wizard_current_atelier_idx"] = 0
 
     if planning.csv_bytes:
-        st.session_state["wizard_active_section"] = 3
+        st.session_state["wizard_active_section"] = 2
     else:
         st.session_state["wizard_active_section"] = 1
 
@@ -889,7 +832,6 @@ def render_scheduling_module(session, user):
         key="scheduling_view",
     )
 
-    # MES PLANNINGS
     if st.session_state["scheduling_view"] == "Mes plannings":
         st.subheader("Mes plannings")
 
@@ -945,7 +887,6 @@ def render_scheduling_module(session, user):
 
         return
 
-    # WIZARD
     planning = _get_current_planning(session, st.session_state["wizard_planning_id"])
 
     top_col1, top_col2 = st.columns([3, 1])
@@ -1008,7 +949,6 @@ def render_scheduling_module(session, user):
                     planning.daily_close = daily_close
                     planning.updated_at = datetime.now(timezone.utc)
                     session.commit()
-                    st.success("Parametres du planning mis a jour.")
                 else:
                     planning = Planning(
                         organization_id=user.organization_id,
@@ -1025,7 +965,6 @@ def render_scheduling_module(session, user):
                     session.commit()
                     session.refresh(planning)
                     st.session_state["wizard_planning_id"] = planning.id
-                    st.success(f"Planning cree avec succes : {planning.name}")
 
                 st.session_state["wizard_active_section"] = 2
                 st.rerun()
@@ -1038,16 +977,15 @@ def render_scheduling_module(session, user):
     if not planning:
         return
 
-    # 2. IMPORT CSV
-    with st.expander("2. Import CSV", expanded=st.session_state["wizard_active_section"] == 2):
+    # 2. IMPORT CSV + MAPPING
+    with st.expander("2. Import CSV + Mapping", expanded=st.session_state["wizard_active_section"] == 2):
         uploaded_file = st.file_uploader(
             "Charger un fichier CSV",
             type=["csv"],
             key=f"csv_upload_{planning.id}"
         )
 
-        if planning.csv_filename:
-            st.success(f"CSV deja enregistre : {planning.csv_filename}")
+        local_df = None
 
         if uploaded_file is not None:
             try:
@@ -1055,31 +993,22 @@ def render_scheduling_module(session, user):
                 planning.csv_bytes = uploaded_file.getvalue()
                 planning.updated_at = datetime.now(timezone.utc)
                 session.commit()
-
-                preview_df = _read_csv_safely(planning.csv_bytes)
-                st.dataframe(preview_df.head(20), use_container_width=True, hide_index=True)
-
-                st.session_state["wizard_tasks_df"] = None
-                st.session_state["wizard_filtered_tasks_df"] = None
-                st.session_state["wizard_selected_df"] = None
-                st.session_state["wizard_teams_df"] = None
-                st.session_state["wizard_generated_df"] = None
-                st.session_state["wizard_unscheduled_df"] = None
-                st.session_state["wizard_active_section"] = 3
-
+                local_df = _read_csv_safely(planning.csv_bytes)
+                st.dataframe(local_df.head(20), use_container_width=True, hide_index=True)
             except Exception as e:
                 session.rollback()
                 st.error(f"Erreur lors du chargement du CSV : {e}")
 
-    # 3. MAPPING
-    with st.expander("3. Mapping colonnes", expanded=st.session_state["wizard_active_section"] == 3):
-        if not planning.csv_bytes:
-            st.info("Charge d'abord un CSV pour passer au mapping.")
-        else:
+        elif planning.csv_bytes:
             try:
-                df = _read_csv_safely(planning.csv_bytes)
-                columns = list(df.columns)
+                local_df = _read_csv_safely(planning.csv_bytes)
+                st.dataframe(local_df.head(20), use_container_width=True, hide_index=True)
+            except Exception as e:
+                st.error(f"Erreur de lecture du CSV enregistre : {e}")
 
+        if local_df is not None:
+            try:
+                columns = list(local_df.columns)
                 saved_mapping = _load_saved_mapping(session, user.organization_id)
                 current_mapping = st.session_state.get("wizard_mapping", {}) or saved_mapping
 
@@ -1116,16 +1045,20 @@ def render_scheduling_module(session, user):
                         st.session_state["wizard_mapping"] = mapping
                         _save_mapping(session, user.organization_id, mapping)
 
-                        tasks_df = _build_tasks_df_from_mapping(df, mapping)
+                        tasks_df = _build_tasks_df_from_mapping(local_df, mapping)
                         st.session_state["wizard_tasks_df"] = tasks_df
-                        st.session_state["wizard_active_section"] = 4
+                        st.session_state["wizard_filtered_tasks_df"] = None
+                        st.session_state["wizard_selected_df"] = None
+                        st.session_state["wizard_generated_df"] = None
+                        st.session_state["wizard_unscheduled_df"] = None
+                        st.session_state["wizard_active_section"] = 3
                         st.rerun()
 
             except Exception as e:
                 st.error(f"Erreur lors du mapping : {e}")
 
-    # 4. SELECTION ATELIERS / SECTEURS
-    with st.expander("4. Selection ateliers / secteurs", expanded=st.session_state["wizard_active_section"] == 4):
+    # 3. SELECTION ATELIERS / SECTEURS
+    with st.expander("3. Selection ateliers / secteurs", expanded=st.session_state["wizard_active_section"] == 3):
         tasks_df = st.session_state.get("wizard_tasks_df")
 
         if tasks_df is None:
@@ -1153,11 +1086,11 @@ def render_scheduling_module(session, user):
                 st.session_state["wizard_selected_ateliers"] = selected_ateliers
                 st.session_state["wizard_selected_secteurs"] = selected_secteurs
                 st.session_state["wizard_filtered_tasks_df"] = filtered_df
-                st.session_state["wizard_active_section"] = 5
+                st.session_state["wizard_active_section"] = 4
                 st.rerun()
 
-    # 5. TEAMS
-    with st.expander("5. Teams", expanded=st.session_state["wizard_active_section"] == 5):
+    # 4. TEAMS
+    with st.expander("4. Teams", expanded=st.session_state["wizard_active_section"] == 4):
         filtered_df = st.session_state.get("wizard_filtered_tasks_df")
         selected_ateliers = st.session_state.get("wizard_selected_ateliers", [])
 
@@ -1226,11 +1159,11 @@ def render_scheduling_module(session, user):
                 )
                 st.session_state["wizard_teams_df"] = teams_df
                 st.session_state["wizard_current_atelier_idx"] = 0
-                st.session_state["wizard_active_section"] = 6
+                st.session_state["wizard_active_section"] = 5
                 st.rerun()
 
-    # 6. SELECTION DES OT PAR ATELIER
-    with st.expander("6. Selection des OT par atelier", expanded=st.session_state["wizard_active_section"] == 6):
+    # 5. SELECTION DES OT PAR ATELIER
+    with st.expander("5. Selection des OT par atelier", expanded=st.session_state["wizard_active_section"] == 5):
         filtered_df = st.session_state.get("wizard_filtered_tasks_df")
         teams_df = st.session_state.get("wizard_teams_df")
         selected_ateliers = st.session_state.get("wizard_selected_ateliers", [])
@@ -1254,10 +1187,6 @@ def render_scheduling_module(session, user):
                 if store_key not in st.session_state:
                     init_df = atelier_df.copy()
                     init_df["selected"] = False
-                    init_df["duration_hours"] = init_df["duration_hours"].fillna(init_df["estimated_hours"])
-                    init_df["predecessor_ot"] = init_df["predecessor_ot"].fillna("")
-                    init_df["forced_start"] = init_df["forced_start"].fillna("")
-                    init_df["forced_team"] = init_df["forced_team"].fillna("")
                     st.session_state[store_key] = init_df
 
                 work_df = st.session_state[store_key].copy()
@@ -1316,7 +1245,6 @@ def render_scheduling_module(session, user):
                     roster = teams_df[teams_df["atelier"] == current_atelier].copy()
                     team_options = roster["code"].astype(str).tolist() if not roster.empty else []
 
-                    # pred options = only already selected OTs in current wizard
                     global_selected = []
                     for at in selected_ateliers:
                         sk = f"atelier_selection_{_safe_key(at)}"
@@ -1425,12 +1353,12 @@ def render_scheduling_module(session, user):
 
                             selected_df = pd.concat(final_frames, ignore_index=True) if final_frames else pd.DataFrame()
                             st.session_state["wizard_selected_df"] = selected_df
-                            st.session_state["wizard_active_section"] = 7
+                            st.session_state["wizard_active_section"] = 6
 
                         st.rerun()
 
-    # 7. GENERATION
-    with st.expander("7. Generation du planning", expanded=st.session_state["wizard_active_section"] == 7):
+    # 6. GENERATION
+    with st.expander("6. Generation du planning", expanded=st.session_state["wizard_active_section"] == 6):
         selected_df = st.session_state.get("wizard_selected_df")
         teams_df = st.session_state.get("wizard_teams_df")
 
