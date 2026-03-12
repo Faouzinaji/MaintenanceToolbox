@@ -21,6 +21,69 @@ from maintenance_toolbox.db import (
 # HELPERS
 # =========================================================
 
+@st.cache_data(show_spinner=False)
+def _read_csv_safely(file_bytes: bytes) -> pd.DataFrame:
+    raw_text = None
+    last_error = None
+
+    for encoding in ["utf-8-sig", "utf-8", "latin-1", "cp1252"]:
+        try:
+            raw_text = file_bytes.decode(encoding)
+            break
+        except Exception as e:
+            last_error = e
+
+    if raw_text is None:
+        raise ValueError(f"Impossible de decoder le fichier : {last_error}")
+
+    sample = raw_text[:5000]
+    delimiters = [",", ";", "\t", "|"]
+    detected_sep = None
+
+    try:
+        dialect = csv.Sniffer().sniff(sample, delimiters=delimiters)
+        detected_sep = dialect.delimiter
+    except Exception:
+        pass
+
+    candidates = []
+    if detected_sep:
+        candidates.append(detected_sep)
+
+    for sep in delimiters:
+        if sep not in candidates:
+            candidates.append(sep)
+
+    best_df = None
+    best_score = -1
+    best_error = None
+
+    for sep in candidates:
+        try:
+            df = pd.read_csv(io.StringIO(raw_text), sep=sep, engine="python")
+            score = len(df.columns)
+
+            if len(df.columns) == 1:
+                first_col = str(df.columns[0])
+                if "," in first_col or ";" in first_col or "\t" in first_col or "|" in first_col:
+                    score = 0
+
+            if score > best_score:
+                best_score = score
+                best_df = df
+
+        except Exception as e:
+            best_error = e
+
+    if best_df is None:
+        raise ValueError(f"Impossible de lire le CSV : {best_error}")
+
+    if best_score <= 0:
+        raise ValueError("Le separateur du CSV n'a pas ete correctement detecte.")
+
+    return best_df
+
+
 def _combine_date_time(d, hhmm: str):
     h, m = hhmm.split(":")
     return datetime.combine(d, time(int(h), int(m)))
@@ -55,68 +118,6 @@ def _parse_dt_any(value, fallback=None):
         return pd.Timestamp(txt)
     except Exception:
         return pd.Timestamp(fallback) if fallback is not None else None
-
-
-def _read_csv_safely(file_bytes: bytes) -> pd.DataFrame:
-    raw_text = None
-    last_error = None
-
-    for encoding in ["utf-8-sig", "utf-8", "latin-1", "cp1252"]:
-        try:
-            raw_text = file_bytes.decode(encoding)
-            break
-        except Exception as e:
-            last_error = e
-
-    if raw_text is None:
-        raise ValueError(f"Impossible de décoder le fichier : {last_error}")
-
-    sample = raw_text[:5000]
-    delimiters = [",", ";", "\t", "|"]
-    detected_sep = None
-
-    try:
-        dialect = csv.Sniffer().sniff(sample, delimiters=delimiters)
-        detected_sep = dialect.delimiter
-    except Exception:
-        pass
-
-    candidates = []
-    if detected_sep:
-        candidates.append(detected_sep)
-
-    for sep in delimiters:
-        if sep not in candidates:
-            candidates.append(sep)
-
-    best_df = None
-    best_score = -1
-    best_error = None
-
-    for sep in candidates:
-        try:
-            df = pd.read_csv(io.StringIO(raw_text), sep=sep, engine="python")
-
-            score = len(df.columns)
-            if len(df.columns) == 1:
-                first_col = str(df.columns[0])
-                if "," in first_col or ";" in first_col or "\t" in first_col or "|" in first_col:
-                    score = 0
-
-            if score > best_score:
-                best_score = score
-                best_df = df
-
-        except Exception as e:
-            best_error = e
-
-    if best_df is None:
-        raise ValueError(f"Impossible de lire le CSV : {best_error}")
-
-    if best_score <= 0:
-        raise ValueError("Le separateur du CSV n'a pas ete correctement detecte.")
-
-    return best_df
 
 
 def _status_score(status):
@@ -164,7 +165,7 @@ def _guess_duration_from_text(description, equipment_desc=""):
 
 
 def _build_comment(row):
-    atelier = _safe_text(row.get("Atelier", row.get("atelier", ""))).upper()
+    atelier = _safe_text(row.get("atelier", "")).upper()
     probable = []
     checks = []
     prep = []
@@ -198,11 +199,12 @@ def _build_comment(row):
 
 
 # =========================================================
-# WIZARD STATE
+# SESSION STATE
 # =========================================================
 
 def _init_wizard_state():
     defaults = {
+        "scheduling_view": "Mes plannings",
         "wizard_planning_id": None,
         "wizard_active_section": 1,
         "wizard_csv_columns": [],
@@ -214,7 +216,6 @@ def _init_wizard_state():
         "wizard_unscheduled_df": None,
         "wizard_team_counts": {},
         "wizard_applied_selection": {},
-        "wizard_open_atelier": None,
         "wizard_selected_df": None,
         "rex_planning_id": None,
     }
@@ -235,7 +236,6 @@ def _reset_wizard():
     st.session_state["wizard_unscheduled_df"] = None
     st.session_state["wizard_team_counts"] = {}
     st.session_state["wizard_applied_selection"] = {}
-    st.session_state["wizard_open_atelier"] = None
     st.session_state["wizard_selected_df"] = None
 
 
@@ -305,7 +305,7 @@ def _delete_planning(session, planning_id):
 
 
 # =========================================================
-# TASKS / TEAMS BUILDERS
+# TASKS / TEAMS
 # =========================================================
 
 def _build_tasks_df_from_mapping(df, mapping):
@@ -340,7 +340,6 @@ def _build_tasks_df_from_mapping(df, mapping):
     ].copy()
 
     out = out.reset_index(drop=True)
-
     out["priority_score"] = out["status"].apply(_status_score)
     out["selected"] = out["status"].apply(_default_status_included)
     out["forced_team"] = ""
@@ -412,15 +411,12 @@ def _prepare_tasks_for_planning(selected_df):
         return pd.DataFrame()
 
     df = selected_df.copy()
-
     df["task_id"] = df["ot_id"].astype(str)
     df["duration_h"] = pd.to_numeric(df["duration_hours"], errors="coerce").fillna(0.0)
     df["forced_start_dt"] = df["forced_start"].apply(lambda x: _parse_dt_any(x, None))
     df["forced_teams_list"] = df["forced_team"].apply(
         lambda x: [t.strip() for t in re.split(r"[;,]", str(x)) if t.strip()]
     )
-
-    # On reste sur le slot principal DURING pour cette version intégrée
     df["slot_type"] = "DURING"
 
     return df[
@@ -592,8 +588,7 @@ def _schedule_standard_tasks(tasks_df, resources_by_atelier, window_start, windo
     return planning_rows, unscheduled_rows, scheduled_map
 
 
-def _generate_schedule(tasks_df, teams_df, planning):
-    selected_df = tasks_df[tasks_df["selected"]].copy()
+def _generate_schedule(selected_df, teams_df, planning):
     selected_ateliers = sorted([x for x in selected_df["atelier"].dropna().astype(str).unique().tolist() if x])
 
     resources_by_atelier = _build_resources_from_team_rosters(
@@ -604,7 +599,6 @@ def _generate_schedule(tasks_df, teams_df, planning):
     )
 
     all_tasks = _prepare_tasks_for_planning(selected_df)
-
     during_df = all_tasks[all_tasks["slot_type"] == "DURING"].copy()
 
     planning_rows = []
@@ -615,14 +609,20 @@ def _generate_schedule(tasks_df, teams_df, planning):
             [r["available_to"] for res in resources_by_atelier.values() for r in res],
             default=pd.Timestamp(planning.end_at),
         )
-        pr, ur, _ = _schedule_standard_tasks(during_df, resources_by_atelier, planning.start_at, latest_end, allow_overrun=True)
+        pr, ur, _ = _schedule_standard_tasks(
+            during_df,
+            resources_by_atelier,
+            planning.start_at,
+            latest_end,
+            allow_overrun=True,
+        )
         planning_rows += pr
         unscheduled_rows += ur
 
     planning_df = pd.DataFrame(planning_rows)
     unscheduled_df = pd.DataFrame(unscheduled_rows)
 
-    result = tasks_df.copy()
+    result = selected_df.copy()
     result["selected_warning"] = ""
     result["planned_start_at"] = ""
     result["planned_end_at"] = ""
@@ -630,7 +630,10 @@ def _generate_schedule(tasks_df, teams_df, planning):
     result["commentaire"] = ""
 
     if not planning_df.empty:
-        planning_df["commentaire"] = planning_df.apply(lambda r: _build_comment({"Atelier": r.get("atelier", "")}), axis=1)
+        planning_df["commentaire"] = planning_df.apply(
+            lambda r: _build_comment({"atelier": r.get("atelier", "")}),
+            axis=1
+        )
 
         for _, row in planning_df.iterrows():
             mask = result["ot_id"] == str(row["ot_id"])
@@ -647,7 +650,7 @@ def _generate_schedule(tasks_df, teams_df, planning):
     return result, unscheduled_df
 
 
-def _persist_generation(session, planning, tasks_df, teams_df):
+def _persist_generation(session, planning, all_tasks_df, teams_df):
     for task in list(planning.tasks):
         session.delete(task)
 
@@ -668,7 +671,7 @@ def _persist_generation(session, planning, tasks_df, teams_df):
             )
         )
 
-    for _, row in tasks_df.iterrows():
+    for _, row in all_tasks_df.iterrows():
         session.add(
             PlanningTask(
                 planning_id=planning.id,
@@ -698,7 +701,6 @@ def _persist_generation(session, planning, tasks_df, teams_df):
 
     planning.status = "generated"
     planning.updated_at = datetime.now(timezone.utc)
-
     session.commit()
     session.refresh(planning)
 
@@ -752,6 +754,7 @@ def _load_teams_df_from_db(planning):
 
 
 def _load_planning_into_wizard(session, user, planning):
+    st.session_state["scheduling_view"] = "Creer un planning"
     st.session_state["wizard_planning_id"] = planning.id
     st.session_state["wizard_mapping"] = _load_saved_mapping(session, user.organization_id)
 
@@ -767,12 +770,8 @@ def _load_planning_into_wizard(session, user, planning):
     if len(planning.tasks) > 0:
         tasks_df = _load_tasks_df_from_db(planning)
         st.session_state["wizard_tasks_df"] = tasks_df
-        st.session_state["wizard_selected_ateliers"] = sorted(
-            [x for x in tasks_df[tasks_df["selected"]]["atelier"].dropna().astype(str).unique().tolist() if x]
-        )
     else:
         st.session_state["wizard_tasks_df"] = None
-        st.session_state["wizard_selected_ateliers"] = []
 
     if len(planning.teams) > 0:
         st.session_state["wizard_teams_df"] = _load_teams_df_from_db(planning)
@@ -780,13 +779,12 @@ def _load_planning_into_wizard(session, user, planning):
         st.session_state["wizard_teams_df"] = None
 
     st.session_state["wizard_applied_selection"] = {}
-    st.session_state["wizard_open_atelier"] = None
     st.session_state["wizard_selected_df"] = None
+    st.session_state["wizard_generated_df"] = None
+    st.session_state["wizard_unscheduled_df"] = None
 
     if len(planning.teams) > 0:
-        st.session_state["wizard_active_section"] = 6
-    elif len(planning.tasks) > 0:
-        st.session_state["wizard_active_section"] = 5
+        st.session_state["wizard_active_section"] = 4
     elif planning.csv_bytes:
         st.session_state["wizard_active_section"] = 3
     else:
@@ -891,12 +889,18 @@ def render_scheduling_module(session, user):
 
     _init_wizard_state()
 
-    tab1, tab2 = st.tabs(["Mes plannings", "Creer un planning"])
+    st.radio(
+        "Navigation Scheduling",
+        options=["Mes plannings", "Creer un planning"],
+        horizontal=True,
+        label_visibility="collapsed",
+        key="scheduling_view",
+    )
 
     # =====================================================
     # MES PLANNINGS
     # =====================================================
-    with tab1:
+    if st.session_state["scheduling_view"] == "Mes plannings":
         st.subheader("Mes plannings")
 
         try:
@@ -924,7 +928,6 @@ def render_scheduling_module(session, user):
                     with c2:
                         if st.button("✏️", key=f"edit_{p.id}", use_container_width=True):
                             _load_planning_into_wizard(session, user, p)
-                            st.session_state["page"] = "scheduling"
                             st.rerun()
 
                     with c3:
@@ -950,549 +953,289 @@ def render_scheduling_module(session, user):
         except Exception as e:
             st.error(f"Erreur lors du chargement des plannings : {e}")
 
+        return
+
     # =====================================================
     # WIZARD
     # =====================================================
-    with tab2:
-        planning = _get_current_planning(session, st.session_state["wizard_planning_id"])
+    planning = _get_current_planning(session, st.session_state["wizard_planning_id"])
 
-        top_col1, top_col2 = st.columns([3, 1])
-        with top_col1:
-            st.subheader("Wizard de creation / modification de planning")
-        with top_col2:
-            if st.button("Nouveau planning", use_container_width=True):
-                _reset_wizard()
+    top_col1, top_col2 = st.columns([3, 1])
+    with top_col1:
+        st.subheader("Wizard de creation / modification de planning")
+    with top_col2:
+        if st.button("Nouveau planning", use_container_width=True):
+            _reset_wizard()
+            st.rerun()
+
+    if planning:
+        st.info(
+            f"Planning en cours : **{planning.name}** | "
+            f"Statut : **{planning.status}** | "
+            f"Periode : **{planning.start_at} → {planning.end_at}**"
+        )
+
+    default_name = planning.name if planning else ""
+    default_sectors = planning.sectors_csv if planning else ""
+    default_start_date = planning.start_at.date() if planning else datetime.now().date()
+    default_end_date = planning.end_at.date() if planning else datetime.now().date()
+    default_daily_open = planning.daily_open if planning else "07:00"
+    default_daily_close = planning.daily_close if planning else "15:00"
+
+    # 1. PARAMETRES
+    with st.expander(
+        "1. Parametres de l'arret",
+        expanded=st.session_state["wizard_active_section"] == 1,
+    ):
+        with st.form("create_planning_form"):
+            name = st.text_input("Nom du planning", value=default_name)
+            sectors_txt = st.text_input("Secteurs (separes par des virgules)", value=default_sectors)
+
+            col1, col2 = st.columns(2)
+
+            with col1:
+                start_date = st.date_input("Date de debut", value=default_start_date)
+                daily_open = st.text_input("Heure d'ouverture", value=default_daily_open)
+
+            with col2:
+                end_date = st.date_input("Date de fin", value=default_end_date)
+                daily_close = st.text_input("Heure de fermeture", value=default_daily_close)
+
+            submitted = st.form_submit_button("Valider les parametres", use_container_width=True)
+
+        if submitted:
+            if not name.strip():
+                st.error("Le nom du planning est obligatoire.")
+                st.stop()
+
+            if end_date < start_date:
+                st.error("La date de fin doit etre posterieure ou egale a la date de debut.")
+                st.stop()
+
+            try:
+                start_at = _combine_date_time(start_date, daily_open)
+                end_at = _combine_date_time(end_date, daily_close)
+
+                if planning:
+                    planning.name = name.strip()
+                    planning.sectors_csv = sectors_txt.strip()
+                    planning.start_at = start_at
+                    planning.end_at = end_at
+                    planning.daily_open = daily_open
+                    planning.daily_close = daily_close
+                    planning.updated_at = datetime.now(timezone.utc)
+                    session.commit()
+                    st.success("Parametres du planning mis a jour.")
+                else:
+                    planning = Planning(
+                        organization_id=user.organization_id,
+                        created_by_user_id=user.id,
+                        name=name.strip(),
+                        sectors_csv=sectors_txt.strip(),
+                        start_at=start_at,
+                        end_at=end_at,
+                        daily_open=daily_open,
+                        daily_close=daily_close,
+                        status="draft",
+                    )
+                    session.add(planning)
+                    session.commit()
+                    session.refresh(planning)
+                    st.session_state["wizard_planning_id"] = planning.id
+                    st.success(f"Planning cree avec succes : {planning.name}")
+
+                st.session_state["wizard_active_section"] = 2
                 st.rerun()
 
-        if planning:
-            st.info(
-                f"Planning en cours : **{planning.name}** | "
-                f"Statut : **{planning.status}** | "
-                f"Periode : **{planning.start_at} → {planning.end_at}**"
-            )
+            except Exception as e:
+                session.rollback()
+                st.error(f"Erreur lors de l'enregistrement des parametres : {e}")
 
-        default_name = planning.name if planning else ""
-        default_sectors = planning.sectors_csv if planning else ""
-        default_start_date = planning.start_at.date() if planning else datetime.now().date()
-        default_end_date = planning.end_at.date() if planning else datetime.now().date()
-        default_daily_open = planning.daily_open if planning else "07:00"
-        default_daily_close = planning.daily_close if planning else "15:00"
+    planning = _get_current_planning(session, st.session_state["wizard_planning_id"])
+    if not planning:
+        return
 
-        # 1. PARAMETRES
-        with st.expander(
-            "1. Parametres de l'arret",
-            expanded=st.session_state["wizard_active_section"] == 1,
-        ):
-            with st.form("create_planning_form"):
-                name = st.text_input("Nom du planning", value=default_name)
-                sectors_txt = st.text_input("Secteurs (separes par des virgules)", value=default_sectors)
+    # 2. IMPORT CSV
+    with st.expander(
+        "2. Import CSV",
+        expanded=st.session_state["wizard_active_section"] == 2,
+    ):
+        uploaded_file = st.file_uploader(
+            "Charger un fichier CSV",
+            type=["csv"],
+            key=f"csv_upload_{planning.id}"
+        )
 
-                col1, col2 = st.columns(2)
+        if planning.csv_filename:
+            st.success(f"CSV deja enregistre : {planning.csv_filename}")
 
-                with col1:
-                    start_date = st.date_input("Date de debut", value=default_start_date)
-                    daily_open = st.text_input("Heure d'ouverture", value=default_daily_open)
+        if uploaded_file is not None:
+            file_bytes = uploaded_file.getvalue()
 
-                with col2:
-                    end_date = st.date_input("Date de fin", value=default_end_date)
-                    daily_close = st.text_input("Heure de fermeture", value=default_daily_close)
+            col1, col2 = st.columns(2)
 
-                submitted = st.form_submit_button("Valider les parametres", use_container_width=True)
-
-            if submitted:
-                if not name.strip():
-                    st.error("Le nom du planning est obligatoire.")
-                    st.stop()
-
-                if end_date < start_date:
-                    st.error("La date de fin doit etre posterieure ou egale a la date de debut.")
-                    st.stop()
-
-                try:
-                    start_at = _combine_date_time(start_date, daily_open)
-                    end_at = _combine_date_time(end_date, daily_close)
-
-                    if planning:
-                        planning.name = name.strip()
-                        planning.sectors_csv = sectors_txt.strip()
-                        planning.start_at = start_at
-                        planning.end_at = end_at
-                        planning.daily_open = daily_open
-                        planning.daily_close = daily_close
+            with col1:
+                if st.button("Enregistrer le CSV", use_container_width=True):
+                    try:
+                        planning.csv_filename = uploaded_file.name
+                        planning.csv_bytes = file_bytes
                         planning.updated_at = datetime.now(timezone.utc)
                         session.commit()
-                        st.success("Parametres du planning mis a jour.")
-                    else:
-                        planning = Planning(
-                            organization_id=user.organization_id,
-                            created_by_user_id=user.id,
-                            name=name.strip(),
-                            sectors_csv=sectors_txt.strip(),
-                            start_at=start_at,
-                            end_at=end_at,
-                            daily_open=daily_open,
-                            daily_close=daily_close,
-                            status="draft",
-                        )
-                        session.add(planning)
-                        session.commit()
-                        session.refresh(planning)
-                        st.session_state["wizard_planning_id"] = planning.id
-                        st.success(f"Planning cree avec succes : {planning.name}")
 
-                    st.session_state["wizard_active_section"] = 2
-                    st.rerun()
+                        st.session_state["wizard_tasks_df"] = None
+                        st.session_state["wizard_teams_df"] = None
+                        st.session_state["wizard_generated_df"] = None
+                        st.session_state["wizard_unscheduled_df"] = None
+                        st.session_state["wizard_applied_selection"] = {}
+                        st.session_state["wizard_selected_df"] = None
+                        st.session_state["wizard_active_section"] = 3
 
-                except Exception as e:
-                    session.rollback()
-                    st.error(f"Erreur lors de l'enregistrement des parametres : {e}")
+                        st.success("CSV enregistre avec succes.")
+                        st.rerun()
 
-        planning = _get_current_planning(session, st.session_state["wizard_planning_id"])
-        if not planning:
-            return
+                    except Exception as e:
+                        session.rollback()
+                        st.error(f"Erreur lors de l'enregistrement du CSV : {e}")
 
-        # 2. IMPORT CSV
-        with st.expander(
-            "2. Import CSV",
-            expanded=st.session_state["wizard_active_section"] == 2,
-        ):
-            uploaded_file = st.file_uploader(
-                "Charger un fichier CSV",
-                type=["csv"],
-                key=f"csv_upload_{planning.id}"
-            )
-
-            if planning.csv_filename:
-                st.success(f"CSV deja enregistre : {planning.csv_filename}")
-
-            if uploaded_file is not None:
-                file_bytes = uploaded_file.getvalue()
-
-                col1, col2 = st.columns(2)
-
-                with col1:
-                    if st.button("Enregistrer le CSV", use_container_width=True):
-                        try:
-                            planning.csv_filename = uploaded_file.name
-                            planning.csv_bytes = file_bytes
-                            planning.updated_at = datetime.now(timezone.utc)
-                            session.commit()
-
-                            st.session_state["wizard_tasks_df"] = None
-                            st.session_state["wizard_teams_df"] = None
-                            st.session_state["wizard_generated_df"] = None
-                            st.session_state["wizard_unscheduled_df"] = None
-                            st.session_state["wizard_applied_selection"] = {}
-                            st.session_state["wizard_selected_df"] = None
-                            st.session_state["wizard_active_section"] = 3
-
-                            st.success("CSV enregistre avec succes.")
-                            st.rerun()
-
-                        except Exception as e:
-                            session.rollback()
-                            st.error(f"Erreur lors de l'enregistrement du CSV : {e}")
-
-                with col2:
-                    if st.button("Afficher le CSV", use_container_width=True):
-                        try:
-                            preview_df = _read_csv_safely(file_bytes)
-                            st.dataframe(preview_df, use_container_width=True, hide_index=True)
-                        except Exception as e:
-                            st.error(f"Erreur de lecture du CSV : {e}")
-
-            if planning.csv_bytes:
-                if st.button("Afficher le CSV enregistre", use_container_width=True):
+            with col2:
+                if st.button("Afficher le CSV", use_container_width=True):
                     try:
-                        preview_df = _read_csv_safely(planning.csv_bytes)
+                        preview_df = _read_csv_safely(file_bytes)
                         st.dataframe(preview_df, use_container_width=True, hide_index=True)
                     except Exception as e:
-                        st.error(f"Erreur de lecture du CSV enregistre : {e}")
+                        st.error(f"Erreur de lecture du CSV : {e}")
 
-        # 3. MAPPING
-        with st.expander(
-            "3. Mapping colonnes",
-            expanded=st.session_state["wizard_active_section"] == 3,
-        ):
-            if not planning.csv_bytes:
-                st.info("Charge d'abord un CSV pour passer au mapping.")
-            else:
+        if planning.csv_bytes:
+            if st.button("Afficher le CSV enregistre", use_container_width=True):
                 try:
-                    df = _read_csv_safely(planning.csv_bytes)
-                    columns = list(df.columns)
+                    preview_df = _read_csv_safely(planning.csv_bytes)
+                    st.dataframe(preview_df, use_container_width=True, hide_index=True)
+                except Exception as e:
+                    st.error(f"Erreur de lecture du CSV enregistre : {e}")
 
-                    saved_mapping = _load_saved_mapping(session, user.organization_id)
-                    current_mapping = st.session_state.get("wizard_mapping", {}) or saved_mapping
+    # 3. MAPPING
+    with st.expander(
+        "3. Mapping colonnes",
+        expanded=st.session_state["wizard_active_section"] == 3,
+    ):
+        if not planning.csv_bytes:
+            st.info("Charge d'abord un CSV pour passer au mapping.")
+        else:
+            try:
+                df = _read_csv_safely(planning.csv_bytes)
+                columns = list(df.columns)
 
-                    targets = [
-                        ("ot_id", "OT"),
-                        ("description", "Description"),
-                        ("status", "Statut"),
-                        ("atelier", "Atelier"),
-                        ("secteur", "Secteur"),
-                        ("equipment", "Equipement"),
-                        ("equipment_desc", "Description equipement"),
-                        ("created_at", "Cree le"),
-                        ("created_by", "Cree par"),
-                        ("requested_week", "Sem. souhaitee"),
-                        ("condition", "Condition realisation"),
-                        ("estimated_hours", "Duree estimee"),
-                    ]
+                saved_mapping = _load_saved_mapping(session, user.organization_id)
+                current_mapping = st.session_state.get("wizard_mapping", {}) or saved_mapping
 
-                    with st.form("mapping_form"):
-                        mapping = {}
-                        options = [""] + columns
+                targets = [
+                    ("ot_id", "OT"),
+                    ("description", "Description"),
+                    ("status", "Statut"),
+                    ("atelier", "Atelier"),
+                    ("secteur", "Secteur"),
+                    ("equipment", "Equipement"),
+                    ("equipment_desc", "Description equipement"),
+                    ("created_at", "Cree le"),
+                    ("created_by", "Cree par"),
+                    ("requested_week", "Sem. souhaitee"),
+                    ("condition", "Condition realisation"),
+                    ("estimated_hours", "Duree estimee"),
+                ]
 
-                        for key, label in targets:
-                            default_val = current_mapping.get(key, "")
-                            default_index = options.index(default_val) if default_val in options else 0
-                            mapping[key] = st.selectbox(
-                                label,
-                                options,
-                                index=default_index,
-                                key=f"map_{key}"
-                            )
+                with st.form("mapping_form"):
+                    mapping = {}
+                    options = [""] + columns
 
-                        submitted_mapping = st.form_submit_button(
-                            "Valider le mapping",
-                            use_container_width=True
+                    for key, label in targets:
+                        default_val = current_mapping.get(key, "")
+                        default_index = options.index(default_val) if default_val in options else 0
+                        mapping[key] = st.selectbox(
+                            label,
+                            options,
+                            index=default_index,
+                            key=f"map_{key}"
                         )
 
-                    if submitted_mapping:
-                        if not mapping["ot_id"] or not mapping["description"] or not mapping["atelier"]:
-                            st.error("Au minimum, mappe OT, Description et Atelier.")
-                        else:
-                            st.session_state["wizard_mapping"] = mapping
-                            _save_mapping(session, user.organization_id, mapping)
-
-                            tasks_df = _build_tasks_df_from_mapping(df, mapping)
-                            st.session_state["wizard_tasks_df"] = tasks_df
-                            st.session_state["wizard_applied_selection"] = {}
-                            st.session_state["wizard_open_atelier"] = None
-                            st.session_state["wizard_selected_df"] = None
-                            st.session_state["wizard_active_section"] = 4
-
-                            st.success("Mapping valide et sauvegarde.")
-                            st.rerun()
-
-                except Exception as e:
-                    st.error(f"Erreur lors du mapping : {e}")
-
-        # 4. SELECTION OT PAR ATELIER
-        with st.expander(
-            "4. Selection des OT par atelier",
-            expanded=st.session_state["wizard_active_section"] == 4,
-        ):
-            tasks_df = st.session_state.get("wizard_tasks_df")
-
-            if tasks_df is None and len(planning.tasks) > 0:
-                tasks_df = _load_tasks_df_from_db(planning)
-                st.session_state["wizard_tasks_df"] = tasks_df
-
-            if tasks_df is None:
-                st.info("Valide d'abord le mapping.")
-            else:
-                stop_hours = max(
-                    1.0,
-                    (pd.Timestamp(planning.end_at) - pd.Timestamp(planning.start_at)).total_seconds() / 3600
-                )
-
-                positive_capacity_ateliers = sorted(
-                    [x for x in tasks_df["atelier"].dropna().astype(str).unique().tolist() if x]
-                )
-
-                if st.session_state["wizard_open_atelier"] is None and positive_capacity_ateliers:
-                    st.session_state["wizard_open_atelier"] = positive_capacity_ateliers[0]
-
-                selected_frames = []
-
-                global_selected_labels = {}
-                for at in positive_capacity_ateliers:
-                    sk = f"applied_{_safe_key(at)}"
-                    if sk in st.session_state["wizard_applied_selection"]:
-                        tmp = st.session_state["wizard_applied_selection"][sk]
-                        tmp_sel = tmp[tmp["selected"] == True].copy() if "selected" in tmp.columns else pd.DataFrame()
-                        if not tmp_sel.empty:
-                            tmp_merge = tasks_df[tasks_df["atelier"].astype(str) == at].merge(
-                                tmp_sel[["ot_id"]], on="ot_id", how="inner"
-                            )
-                            for _, rr in tmp_merge.iterrows():
-                                otid = str(rr["ot_id"])
-                                desc = rr.get("description", "")
-                                equip = rr.get("equipment_desc", "")
-                                global_selected_labels[otid] = f"{otid} | {_shorten(desc, 45)} | {_shorten(equip, 35)}"
-
-                for idx, atelier in enumerate(positive_capacity_ateliers):
-                    atelier_df = tasks_df[tasks_df["atelier"].astype(str) == atelier].copy()
-                    if atelier_df.empty:
-                        continue
-
-                    atelier_df = atelier_df.sort_values(
-                        ["priority_score", "duration_hours"],
-                        ascending=[False, True]
-                    ).copy()
-
-                    store_key = f"applied_{_safe_key(atelier)}"
-                    if store_key not in st.session_state["wizard_applied_selection"]:
-                        init_df = atelier_df.copy()
-                        init_df["selected"] = init_df["selected"].fillna(False)
-                        init_df["duration_hours"] = init_df["duration_hours"].fillna(init_df["estimated_hours"])
-                        init_df["predecessor_ot"] = init_df["predecessor_ot"].fillna("")
-                        init_df["forced_start"] = init_df["forced_start"].fillna("")
-                        init_df["forced_team"] = init_df["forced_team"].fillna("")
-                        st.session_state["wizard_applied_selection"][store_key] = init_df[
-                            ["ot_id", "selected", "duration_hours", "predecessor_ot", "forced_start", "forced_team"]
-                        ].copy()
-
-                    merged_df = atelier_df.merge(
-                        st.session_state["wizard_applied_selection"][store_key],
-                        on="ot_id",
-                        how="left",
-                        suffixes=("", "_saved")
+                    submitted_mapping = st.form_submit_button(
+                        "Valider le mapping",
+                        use_container_width=True
                     )
 
-                    if "selected_saved" in merged_df.columns:
-                        merged_df["selected"] = merged_df["selected_saved"].fillna(merged_df["selected"])
-                    if "duration_hours_saved" in merged_df.columns:
-                        merged_df["duration_hours"] = merged_df["duration_hours_saved"].fillna(merged_df["duration_hours"])
-                    if "predecessor_ot_saved" in merged_df.columns:
-                        merged_df["predecessor_ot"] = merged_df["predecessor_ot_saved"].fillna("")
-                    if "forced_start_saved" in merged_df.columns:
-                        merged_df["forced_start"] = merged_df["forced_start_saved"].fillna("")
-                    if "forced_team_saved" in merged_df.columns:
-                        merged_df["forced_team"] = merged_df["forced_team_saved"].fillna("")
+                if submitted_mapping:
+                    if not mapping["ot_id"] or not mapping["description"] or not mapping["atelier"]:
+                        st.error("Au minimum, mappe OT, Description et Atelier.")
+                    else:
+                        st.session_state["wizard_mapping"] = mapping
+                        _save_mapping(session, user.organization_id, mapping)
 
-                    merged_df["description_short"] = merged_df["description"].apply(lambda x: _shorten(x, 32))
-                    merged_df["equipment_short"] = merged_df["equipment_desc"].apply(lambda x: _shorten(x, 26))
+                        tasks_df = _build_tasks_df_from_mapping(df, mapping)
+                        st.session_state["wizard_tasks_df"] = tasks_df
+                        st.session_state["wizard_active_section"] = 4
+                        st.success("Mapping valide et sauvegarde.")
+                        st.rerun()
 
-                    selected_preview = merged_df[merged_df["selected"] == True].copy()
-                    preview_hours = float(selected_preview["duration_hours"].sum()) if len(selected_preview) > 0 else 0.0
-                    capacity_hours = stop_hours  # affiche d'abord la charge sélectionnée; la capacité finale se fait en teams
+            except Exception as e:
+                st.error(f"Erreur lors du mapping : {e}")
 
-                    exp_label = f"{atelier} | Charge selectionnee: {preview_hours:.1f} h"
-                    expanded_state = st.session_state["wizard_open_atelier"] == atelier
+    # 4. TEAMS AVANT SELECTION OT
+    with st.expander(
+        "4. Teams",
+        expanded=st.session_state["wizard_active_section"] == 4,
+    ):
+        tasks_df = st.session_state.get("wizard_tasks_df")
 
-                    with st.expander(exp_label, expanded=expanded_state):
-                        with st.form(f"form_{_safe_key(atelier)}", clear_on_submit=False):
-                            editor_df = merged_df[
-                                [
-                                    "selected",
-                                    "ot_id",
-                                    "description_short",
-                                    "equipment_short",
-                                    "status",
-                                    "duration_hours",
-                                    "created_at",
-                                    "created_by",
-                                    "requested_week",
-                                    "condition",
-                                ]
-                            ].copy()
+        if tasks_df is None:
+            st.info("Valide d'abord le mapping.")
+        else:
+            all_ateliers = sorted([x for x in tasks_df["atelier"].dropna().astype(str).unique().tolist() if x])
+            stop_hours = max(
+                1.0,
+                (pd.Timestamp(planning.end_at) - pd.Timestamp(planning.start_at)).total_seconds() / 3600
+            )
 
-                            edited_main = st.data_editor(
-                                editor_df,
-                                use_container_width=True,
-                                hide_index=True,
-                                num_rows="fixed",
-                                column_config={
-                                    "selected": st.column_config.CheckboxColumn(""),
-                                    "ot_id": st.column_config.TextColumn("Ordre de travail", disabled=True),
-                                    "description_short": st.column_config.TextColumn("Description", disabled=True),
-                                    "equipment_short": st.column_config.TextColumn("Equipement", disabled=True),
-                                    "status": st.column_config.TextColumn("Statut", disabled=True),
-                                    "duration_hours": st.column_config.NumberColumn("Duree retenue (h)", min_value=0.0, step=0.5),
-                                    "created_at": st.column_config.TextColumn("Cree le", disabled=True),
-                                    "created_by": st.column_config.TextColumn("Cree par", disabled=True),
-                                    "requested_week": st.column_config.TextColumn("Sem. souhaitee", disabled=True),
-                                    "condition": st.column_config.TextColumn("Cond Real", disabled=True),
-                                },
-                                key=f"editor_{_safe_key(atelier)}"
-                            )
-
-                            selected_rows = edited_main[edited_main["selected"] == True].copy()
-
-                            team_roster_df = st.session_state.get("wizard_teams_df")
-                            team_options = []
-                            if team_roster_df is not None and not team_roster_df.empty:
-                                roster = team_roster_df[team_roster_df["atelier"] == atelier].copy()
-                                for _, rr in roster.iterrows():
-                                    code = str(rr.get("code", "")).strip()
-                                    name = str(rr.get("name", "")).strip()
-                                    if code:
-                                        label = f"{code} | {name}" if name and name != code else code
-                                        team_options.append((code, label))
-
-                            team_code_options = [x[0] for x in team_options]
-                            team_label_map = {c: l for c, l in team_options}
-
-                            updated_pred = {}
-                            updated_fstart = {}
-                            updated_teams = {}
-
-                            store_map = st.session_state["wizard_applied_selection"][store_key].set_index("ot_id").to_dict("index")
-
-                            for _, r in selected_rows.iterrows():
-                                ot_id = str(r["ot_id"])
-
-                                pred_options = [""] + [x for x in sorted(global_selected_labels.keys()) if x != ot_id]
-                                current_pred = str(store_map.get(ot_id, {}).get("predecessor_ot", "") or "")
-                                if current_pred not in pred_options:
-                                    current_pred = ""
-
-                                desc_label = _shorten(
-                                    atelier_df.loc[atelier_df["ot_id"].astype(str) == ot_id, "description"].iloc[0]
-                                    if len(atelier_df.loc[atelier_df["ot_id"].astype(str) == ot_id]) > 0 else "",
-                                    30
-                                )
-                                equip_label = _shorten(
-                                    atelier_df.loc[atelier_df["ot_id"].astype(str) == ot_id, "equipment_desc"].iloc[0]
-                                    if len(atelier_df.loc[atelier_df["ot_id"].astype(str) == ot_id]) > 0 else "",
-                                    25
-                                )
-
-                                pred_val = st.selectbox(
-                                    f"Predecesseur pour OT {ot_id} - {desc_label} - {equip_label}",
-                                    options=pred_options,
-                                    index=pred_options.index(current_pred) if current_pred in pred_options else 0,
-                                    format_func=lambda x: "Aucun" if x == "" else global_selected_labels.get(x, x),
-                                    key=f"pred_{_safe_key(atelier)}_{ot_id}"
-                                )
-                                updated_pred[ot_id] = pred_val
-
-                                current_fstart = str(store_map.get(ot_id, {}).get("forced_start", "") or "")
-                                forced_start_val = st.text_input(
-                                    f"Heure de debut forcee pour OT {ot_id} (YYYY-MM-DD HH:MM)",
-                                    value=current_fstart,
-                                    key=f"fstart_{_safe_key(atelier)}_{ot_id}"
-                                )
-                                updated_fstart[ot_id] = forced_start_val
-
-                                current_teams_raw = str(store_map.get(ot_id, {}).get("forced_team", "") or "")
-                                current_teams_list = [x.strip() for x in re.split(r"[;,]", current_teams_raw) if x.strip()]
-                                current_teams_list = [x for x in current_teams_list if x in team_code_options]
-
-                                forced_team_sel = st.multiselect(
-                                    f"Equipes forcees pour OT {ot_id}",
-                                    options=team_code_options,
-                                    default=current_teams_list,
-                                    format_func=lambda x: team_label_map.get(x, x),
-                                    key=f"fteams_{_safe_key(atelier)}_{ot_id}"
-                                )
-                                updated_teams[ot_id] = forced_team_sel
-
-                            if st.form_submit_button(f"Valider atelier - {atelier}", use_container_width=True):
-                                saved_df = st.session_state["wizard_applied_selection"][store_key].copy()
-                                saved_df["OT_STR"] = saved_df["ot_id"].astype(str)
-
-                                edited_main_local = edited_main.copy()
-                                edited_main_local["OT_STR"] = edited_main_local["ot_id"].astype(str)
-
-                                saved_df["selected"] = saved_df["OT_STR"].map(
-                                    edited_main_local.set_index("OT_STR")["selected"].to_dict()
-                                ).fillna(saved_df["selected"])
-
-                                saved_df["duration_hours"] = saved_df["OT_STR"].map(
-                                    edited_main_local.set_index("OT_STR")["duration_hours"].to_dict()
-                                ).fillna(saved_df["duration_hours"])
-
-                                saved_df["predecessor_ot"] = saved_df["OT_STR"].map(updated_pred).fillna(saved_df["predecessor_ot"])
-                                saved_df["forced_start"] = saved_df["OT_STR"].map(updated_fstart).fillna(saved_df["forced_start"])
-                                saved_df["forced_team"] = saved_df["OT_STR"].map(lambda x: "; ".join(updated_teams.get(x, []))).fillna(saved_df["forced_team"])
-                                saved_df.drop(columns=["OT_STR"], inplace=True)
-
-                                st.session_state["wizard_applied_selection"][store_key] = saved_df
-
-                                next_idx = idx + 1
-                                st.session_state["wizard_open_atelier"] = positive_capacity_ateliers[next_idx] if next_idx < len(positive_capacity_ateliers) else None
-                                if next_idx >= len(positive_capacity_ateliers):
-                                    st.session_state["wizard_active_section"] = 5
-                                st.rerun()
-
-                        if len(selected_rows) > 0:
-                            store_extra = st.session_state["wizard_applied_selection"][store_key][
-                                ["ot_id", "predecessor_ot", "forced_start", "forced_team"]
-                            ].copy()
-                            selected_rows = selected_rows.merge(store_extra, on="ot_id", how="left", suffixes=("", "_y"))
-                            for c in ["predecessor_ot", "forced_start", "forced_team"]:
-                                cy = f"{c}_y"
-                                if cy in selected_rows.columns:
-                                    selected_rows[c] = selected_rows[cy]
-                                    selected_rows.drop(columns=[cy], inplace=True)
-
-                            selected_frames.append(selected_rows)
-
-                selected_df = pd.concat(selected_frames, ignore_index=True) if selected_frames else pd.DataFrame()
-                st.session_state["wizard_selected_df"] = selected_df
-
-        # 5. TEAMS
-        with st.expander(
-            "5. Teams",
-            expanded=st.session_state["wizard_active_section"] == 5,
-        ):
-            selected_df = st.session_state.get("wizard_selected_df")
-
-            if selected_df is None or selected_df.empty:
-                st.info("Valide d'abord la selection des OT par atelier.")
-            else:
-                stop_hours = max(
-                    1.0,
-                    (pd.Timestamp(planning.end_at) - pd.Timestamp(planning.start_at)).total_seconds() / 3600
-                )
-                selected_ateliers = sorted([x for x in selected_df["atelier"].dropna().astype(str).unique().tolist() if x])
-                st.session_state["wizard_selected_ateliers"] = selected_ateliers
-
-                atelier_load = (
-                    selected_df.groupby("atelier", as_index=False)["duration_hours"]
-                    .sum()
-                    .rename(columns={"duration_hours": "Charge selectionnee (h)"})
-                )
-                atelier_load["Besoin theorique (equipes)"] = atelier_load["Charge selectionnee (h)"].apply(
-                    lambda x: max(1, math.ceil(x / stop_hours)) if x > 0 else 1
+            with st.form("teams_form"):
+                selected_ateliers = st.multiselect(
+                    "Ateliers retenus pour l'arret",
+                    options=all_ateliers,
+                    default=st.session_state["wizard_selected_ateliers"] or all_ateliers,
                 )
 
                 all_rosters = []
 
                 for atelier in selected_ateliers:
-                    row = atelier_load[atelier_load["atelier"].astype(str) == atelier]
-                    theoretical = int(row["Besoin theorique (equipes)"].iloc[0]) if not row.empty else 1
-                    current_nb = int(st.session_state["wizard_team_counts"].get(atelier, theoretical))
+                    atelier_df = tasks_df[tasks_df["atelier"] == atelier].copy()
+                    total_hours = float(atelier_df["duration_hours"].sum()) if not atelier_df.empty else 0.0
+                    theoretical = max(1, math.ceil(total_hours / stop_hours)) if total_hours > 0 else 1
+                    default_nb = int(st.session_state["wizard_team_counts"].get(atelier, theoretical))
+
+                    st.markdown(f"**{atelier}** — charge theorique detectee : {round(total_hours,1)} h")
 
                     nb_equipes = st.number_input(
-                        f"{atelier} - nombre d'equipes",
+                        f"{atelier} - nombre d'equipes disponibles",
                         min_value=0,
                         max_value=max(20, theoretical + 10),
-                        value=current_nb,
+                        value=default_nb,
                         step=1,
                         key=f"teams_{_safe_key(atelier)}"
                     )
                     st.session_state["wizard_team_counts"][atelier] = nb_equipes
 
-                    existing_df = st.session_state.get("wizard_teams_df")
-                    atelier_existing = existing_df[existing_df["atelier"] == atelier].copy() if existing_df is not None and not existing_df.empty else pd.DataFrame()
-
-                    if atelier_existing.empty:
-                        atelier_existing = _initialize_team_roster(
-                            atelier=atelier,
-                            n_teams=max(1, nb_equipes),
-                            start_dt=pd.Timestamp(planning.start_at),
-                            end_dt=pd.Timestamp(planning.end_at),
-                        )
-
-                    if nb_equipes > len(atelier_existing):
-                        atelier_existing = _initialize_team_roster(
-                            atelier=atelier,
-                            n_teams=nb_equipes,
-                            start_dt=pd.Timestamp(planning.start_at),
-                            end_dt=pd.Timestamp(planning.end_at),
-                        )
-                    elif nb_equipes < len(atelier_existing):
-                        atelier_existing = atelier_existing.iloc[:nb_equipes].copy()
+                    roster_df = _initialize_team_roster(
+                        atelier=atelier,
+                        n_teams=max(1, nb_equipes) if nb_equipes > 0 else 0,
+                        start_dt=pd.Timestamp(planning.start_at),
+                        end_dt=pd.Timestamp(planning.end_at),
+                    ) if nb_equipes > 0 else pd.DataFrame(
+                        columns=["atelier", "code", "name", "available_from", "available_to"]
+                    )
 
                     if nb_equipes > 0:
                         edited_roster = st.data_editor(
-                            atelier_existing,
+                            roster_df,
                             use_container_width=True,
                             hide_index=True,
+                            num_rows="fixed",
                             key=f"roster_{_safe_key(atelier)}",
                             column_config={
                                 "atelier": st.column_config.TextColumn("Atelier", disabled=True),
@@ -1500,105 +1243,357 @@ def render_scheduling_module(session, user):
                                 "name": st.column_config.TextColumn("Nom equipe"),
                                 "available_from": st.column_config.TextColumn("Debut disponibilite"),
                                 "available_to": st.column_config.TextColumn("Fin disponibilite"),
-                            }
+                            },
                         )
                         all_rosters.append(edited_roster.copy())
 
                     st.divider()
 
-                if st.button("Valider les equipes et passer a la generation", use_container_width=True, key="validate_teams_btn"):
-                    teams_df = pd.concat(all_rosters, ignore_index=True) if all_rosters else pd.DataFrame(
-                        columns=["atelier", "code", "name", "available_from", "available_to"]
-                    )
-                    st.session_state["wizard_teams_df"] = teams_df
+                submit_teams = st.form_submit_button("Valider les equipes", use_container_width=True)
+
+            if submit_teams:
+                teams_df = pd.concat(all_rosters, ignore_index=True) if all_rosters else pd.DataFrame(
+                    columns=["atelier", "code", "name", "available_from", "available_to"]
+                )
+                st.session_state["wizard_selected_ateliers"] = selected_ateliers
+                st.session_state["wizard_teams_df"] = teams_df
+                st.session_state["wizard_active_section"] = 5
+                st.rerun()
+
+    # 5. SELECTION OT PAR ATELIER
+    with st.expander(
+        "5. Selection des OT par atelier",
+        expanded=st.session_state["wizard_active_section"] == 5,
+    ):
+        tasks_df = st.session_state.get("wizard_tasks_df")
+        teams_df = st.session_state.get("wizard_teams_df")
+        selected_ateliers = st.session_state.get("wizard_selected_ateliers", [])
+
+        if tasks_df is None or not selected_ateliers:
+            st.info("Valide d'abord les equipes.")
+        else:
+            selected_frames = []
+
+            global_selected_labels = {}
+            for at in selected_ateliers:
+                sk = f"applied_{_safe_key(at)}"
+                if sk in st.session_state["wizard_applied_selection"]:
+                    tmp = st.session_state["wizard_applied_selection"][sk]
+                    tmp_sel = tmp[tmp["selected"] == True].copy() if "selected" in tmp.columns else pd.DataFrame()
+                    if not tmp_sel.empty:
+                        tmp_merge = tasks_df[tasks_df["atelier"].astype(str) == at].merge(
+                            tmp_sel[["ot_id"]], on="ot_id", how="inner"
+                        )
+                        for _, rr in tmp_merge.iterrows():
+                            otid = str(rr["ot_id"])
+                            desc = rr.get("description", "")
+                            equip = rr.get("equipment_desc", "")
+                            global_selected_labels[otid] = f"{otid} | {_shorten(desc, 45)} | {_shorten(equip, 35)}"
+
+            for atelier in selected_ateliers:
+                atelier_df = tasks_df[tasks_df["atelier"].astype(str) == atelier].copy()
+                if atelier_df.empty:
+                    continue
+
+                atelier_df = atelier_df.sort_values(
+                    ["priority_score", "duration_hours"],
+                    ascending=[False, True]
+                ).copy()
+
+                store_key = f"applied_{_safe_key(atelier)}"
+                if store_key not in st.session_state["wizard_applied_selection"]:
+                    init_df = atelier_df.copy()
+                    init_df["selected"] = init_df["selected"].fillna(True)
+                    init_df["duration_hours"] = init_df["duration_hours"].fillna(init_df["estimated_hours"])
+                    init_df["predecessor_ot"] = init_df["predecessor_ot"].fillna("")
+                    init_df["forced_start"] = init_df["forced_start"].fillna("")
+                    init_df["forced_team"] = init_df["forced_team"].fillna("")
+                    st.session_state["wizard_applied_selection"][store_key] = init_df[
+                        ["ot_id", "selected", "duration_hours", "predecessor_ot", "forced_start", "forced_team"]
+                    ].copy()
+
+                merged_df = atelier_df.merge(
+                    st.session_state["wizard_applied_selection"][store_key],
+                    on="ot_id",
+                    how="left",
+                    suffixes=("", "_saved")
+                )
+
+                if "selected_saved" in merged_df.columns:
+                    merged_df["selected"] = merged_df["selected_saved"].fillna(merged_df["selected"])
+                if "duration_hours_saved" in merged_df.columns:
+                    merged_df["duration_hours"] = merged_df["duration_hours_saved"].fillna(merged_df["duration_hours"])
+                if "predecessor_ot_saved" in merged_df.columns:
+                    merged_df["predecessor_ot"] = merged_df["predecessor_ot_saved"].fillna("")
+                if "forced_start_saved" in merged_df.columns:
+                    merged_df["forced_start"] = merged_df["forced_start_saved"].fillna("")
+                if "forced_team_saved" in merged_df.columns:
+                    merged_df["forced_team"] = merged_df["forced_team_saved"].fillna("")
+
+                selected_preview = merged_df[merged_df["selected"] == True].copy()
+                preview_hours = float(selected_preview["duration_hours"].sum()) if len(selected_preview) > 0 else 0.0
+
+                exp_label = f"{atelier} | Charge selectionnee : {preview_hours:.1f} h"
+
+                with st.expander(exp_label, expanded=False):
+                    with st.form(f"form_{_safe_key(atelier)}"):
+                        editor_df = merged_df[
+                            [
+                                "selected",
+                                "ot_id",
+                                "description",
+                                "equipment_desc",
+                                "status",
+                                "duration_hours",
+                                "created_at",
+                                "created_by",
+                                "requested_week",
+                                "condition",
+                            ]
+                        ].copy()
+
+                        editor_df["description"] = editor_df["description"].apply(lambda x: _shorten(x, 38))
+                        editor_df["equipment_desc"] = editor_df["equipment_desc"].apply(lambda x: _shorten(x, 28))
+
+                        edited_main = st.data_editor(
+                            editor_df,
+                            use_container_width=True,
+                            hide_index=True,
+                            num_rows="fixed",
+                            key=f"editor_{_safe_key(atelier)}",
+                            column_config={
+                                "selected": st.column_config.CheckboxColumn(""),
+                                "ot_id": st.column_config.TextColumn("Ordre de travail", disabled=True),
+                                "description": st.column_config.TextColumn("Description", disabled=True),
+                                "equipment_desc": st.column_config.TextColumn("Equipement", disabled=True),
+                                "status": st.column_config.TextColumn("Statut", disabled=True),
+                                "duration_hours": st.column_config.NumberColumn("Duree retenue (h)", min_value=0.0, step=0.5),
+                                "created_at": st.column_config.TextColumn("Cree le", disabled=True),
+                                "created_by": st.column_config.TextColumn("Cree par", disabled=True),
+                                "requested_week": st.column_config.TextColumn("Sem. souhaitee", disabled=True),
+                                "condition": st.column_config.TextColumn("Cond Real", disabled=True),
+                            },
+                        )
+
+                        selected_rows = edited_main[edited_main["selected"] == True].copy()
+
+                        # options equipes forcees
+                        roster = teams_df[teams_df["atelier"] == atelier].copy() if teams_df is not None and not teams_df.empty else pd.DataFrame()
+                        team_code_options = roster["code"].astype(str).tolist() if not roster.empty else []
+
+                        updated_pred = {}
+                        updated_fstart = {}
+                        updated_teams = {}
+
+                        store_map = st.session_state["wizard_applied_selection"][store_key].set_index("ot_id").to_dict("index")
+
+                        current_form_selected_labels = dict(global_selected_labels)
+                        for _, rr in selected_rows.iterrows():
+                            otid = str(rr["ot_id"])
+                            current_form_selected_labels[otid] = f"{otid} | {_shorten(rr['description'], 45)} | {_shorten(rr['equipment_desc'], 35)}"
+
+                        for _, r in selected_rows.iterrows():
+                            ot_id = str(r["ot_id"])
+
+                            pred_options = [""] + [x for x in sorted(current_form_selected_labels.keys()) if x != ot_id]
+                            current_pred = str(store_map.get(ot_id, {}).get("predecessor_ot", "") or "")
+                            if current_pred not in pred_options:
+                                current_pred = ""
+
+                            pred_val = st.selectbox(
+                                f"Predecesseur pour OT {ot_id}",
+                                options=pred_options,
+                                index=pred_options.index(current_pred) if current_pred in pred_options else 0,
+                                format_func=lambda x: "Aucun" if x == "" else current_form_selected_labels.get(x, x),
+                                key=f"pred_{_safe_key(atelier)}_{ot_id}"
+                            )
+                            updated_pred[ot_id] = pred_val
+
+                            current_fstart = str(store_map.get(ot_id, {}).get("forced_start", "") or "")
+                            forced_start_val = st.text_input(
+                                f"Heure debut forcee pour OT {ot_id} (YYYY-MM-DD HH:MM)",
+                                value=current_fstart,
+                                key=f"fstart_{_safe_key(atelier)}_{ot_id}"
+                            )
+                            updated_fstart[ot_id] = forced_start_val
+
+                            current_teams_raw = str(store_map.get(ot_id, {}).get("forced_team", "") or "")
+                            current_teams_list = [x.strip() for x in re.split(r"[;,]", current_teams_raw) if x.strip()]
+                            current_teams_list = [x for x in current_teams_list if x in team_code_options]
+
+                            forced_team_sel = st.multiselect(
+                                f"Equipes forcees pour OT {ot_id}",
+                                options=team_code_options,
+                                default=current_teams_list,
+                                key=f"fteams_{_safe_key(atelier)}_{ot_id}"
+                            )
+                            updated_teams[ot_id] = forced_team_sel
+
+                        submit_atelier = st.form_submit_button(f"Valider atelier - {atelier}", use_container_width=True)
+
+                    if submit_atelier:
+                        saved_df = st.session_state["wizard_applied_selection"][store_key].copy()
+                        saved_df["OT_STR"] = saved_df["ot_id"].astype(str)
+
+                        edited_main_local = edited_main.copy()
+                        edited_main_local["OT_STR"] = edited_main_local["ot_id"].astype(str)
+
+                        saved_df["selected"] = saved_df["OT_STR"].map(
+                            edited_main_local.set_index("OT_STR")["selected"].to_dict()
+                        ).fillna(saved_df["selected"])
+
+                        saved_df["duration_hours"] = saved_df["OT_STR"].map(
+                            edited_main_local.set_index("OT_STR")["duration_hours"].to_dict()
+                        ).fillna(saved_df["duration_hours"])
+
+                        saved_df["predecessor_ot"] = saved_df["OT_STR"].map(updated_pred).fillna(saved_df["predecessor_ot"])
+                        saved_df["forced_start"] = saved_df["OT_STR"].map(updated_fstart).fillna(saved_df["forced_start"])
+                        saved_df["forced_team"] = saved_df["OT_STR"].map(lambda x: "; ".join(updated_teams.get(x, []))).fillna(saved_df["forced_team"])
+                        saved_df.drop(columns=["OT_STR"], inplace=True)
+
+                        st.session_state["wizard_applied_selection"][store_key] = saved_df
+                        st.success(f"Selection enregistree pour {atelier}.")
+                        st.rerun()
+
+                    current_saved = st.session_state["wizard_applied_selection"][store_key].copy()
+                    selected_now = current_saved[current_saved["selected"] == True].copy()
+                    if not selected_now.empty:
+                        selected_frames.append(atelier_df.merge(selected_now, on="ot_id", how="inner", suffixes=("", "_saved")))
+
+            if st.button("Finaliser la selection des OT", use_container_width=True, key="finalize_ot_btn"):
+                final_frames = []
+                for atelier in selected_ateliers:
+                    store_key = f"applied_{_safe_key(atelier)}"
+                    if store_key not in st.session_state["wizard_applied_selection"]:
+                        continue
+
+                    atelier_df = tasks_df[tasks_df["atelier"].astype(str) == atelier].copy()
+                    saved = st.session_state["wizard_applied_selection"][store_key].copy()
+                    saved = saved[saved["selected"] == True].copy()
+
+                    if saved.empty:
+                        continue
+
+                    merged = atelier_df.merge(saved, on="ot_id", how="inner", suffixes=("", "_saved"))
+
+                    if "selected_saved" in merged.columns:
+                        merged["selected"] = merged["selected_saved"]
+                    if "duration_hours_saved" in merged.columns:
+                        merged["duration_hours"] = merged["duration_hours_saved"]
+                    if "predecessor_ot_saved" in merged.columns:
+                        merged["predecessor_ot"] = merged["predecessor_ot_saved"]
+                    if "forced_start_saved" in merged.columns:
+                        merged["forced_start"] = merged["forced_start_saved"]
+                    if "forced_team_saved" in merged.columns:
+                        merged["forced_team"] = merged["forced_team_saved"]
+
+                    drop_cols = [c for c in merged.columns if c.endswith("_saved")]
+                    if drop_cols:
+                        merged.drop(columns=drop_cols, inplace=True)
+
+                    final_frames.append(merged)
+
+                selected_df = pd.concat(final_frames, ignore_index=True) if final_frames else pd.DataFrame()
+
+                if selected_df.empty:
+                    st.error("Aucun OT selectionne.")
+                else:
+                    st.session_state["wizard_selected_df"] = selected_df
                     st.session_state["wizard_active_section"] = 6
                     st.rerun()
 
-        # 6. GENERATION
-        with st.expander(
-            "6. Generation du planning",
-            expanded=st.session_state["wizard_active_section"] == 6,
-        ):
-            selected_df = st.session_state.get("wizard_selected_df")
-            teams_df = st.session_state.get("wizard_teams_df")
+    # 6. GENERATION
+    with st.expander(
+        "6. Generation du planning",
+        expanded=st.session_state["wizard_active_section"] == 6,
+    ):
+        selected_df = st.session_state.get("wizard_selected_df")
+        teams_df = st.session_state.get("wizard_teams_df")
 
-            if selected_df is None or teams_df is None:
-                st.info("Valide d'abord la selection OT et les equipes.")
-            else:
-                selected_ateliers = st.session_state.get("wizard_selected_ateliers", [])
-                stop_hours = max(
-                    1.0,
-                    (pd.Timestamp(planning.end_at) - pd.Timestamp(planning.start_at)).total_seconds() / 3600
+        if selected_df is None or teams_df is None:
+            st.info("Valide d'abord la selection OT et les equipes.")
+        else:
+            selected_ateliers = st.session_state.get("wizard_selected_ateliers", [])
+            stop_hours = max(
+                1.0,
+                (pd.Timestamp(planning.end_at) - pd.Timestamp(planning.start_at)).total_seconds() / 3600
+            )
+
+            total_selected_hours = float(selected_df["duration_hours"].sum()) if not selected_df.empty else 0.0
+            total_capacity_hours = float(
+                sum(
+                    len(teams_df[teams_df["atelier"] == a]) * stop_hours
+                    for a in selected_ateliers
                 )
+            )
 
-                total_selected_hours = float(selected_df["duration_hours"].sum()) if not selected_df.empty else 0.0
-                total_capacity_hours = float(
-                    sum(
-                        len(teams_df[teams_df["atelier"] == a]) * stop_hours
-                        for a in selected_ateliers
+            c1, c2, c3 = st.columns(3)
+            c1.metric("OT selectionnes", len(selected_df))
+            c2.metric("Charge selectionnee (h)", round(total_selected_hours, 1))
+            c3.metric("Capacite theorique totale (h)", round(total_capacity_hours, 1))
+
+            if st.button("Generer et enregistrer le planning", type="primary", use_container_width=True, key="generate_planning_btn"):
+                try:
+                    generated_selected_df, unscheduled_df = _generate_schedule(
+                        selected_df=selected_df,
+                        teams_df=teams_df,
+                        planning=planning,
                     )
-                )
 
-                c1, c2, c3 = st.columns(3)
-                c1.metric("OT selectionnes", len(selected_df))
-                c2.metric("Charge selectionnee (h)", round(total_selected_hours, 1))
-                c3.metric("Capacite theorique totale (h)", round(total_capacity_hours, 1))
+                    all_tasks_df = st.session_state.get("wizard_tasks_df").copy()
+                    all_tasks_df["selected"] = False
+                    all_tasks_df["selected_warning"] = ""
+                    all_tasks_df["planned_start_at"] = ""
+                    all_tasks_df["planned_end_at"] = ""
+                    all_tasks_df["planned_team_name"] = ""
+                    all_tasks_df["commentaire"] = ""
 
-                if st.button("Generer et enregistrer le planning", type="primary", use_container_width=True, key="generate_planning_btn"):
-                    try:
-                        generated_df, unscheduled_df = _generate_schedule(
-                            tasks_df=selected_df,
-                            teams_df=teams_df,
-                            planning=planning,
-                        )
+                    for _, row in generated_selected_df.iterrows():
+                        mask = all_tasks_df["ot_id"] == row["ot_id"]
+                        all_tasks_df.loc[mask, "selected"] = True
+                        all_tasks_df.loc[mask, "duration_hours"] = row.get("duration_hours", all_tasks_df.loc[mask, "duration_hours"])
+                        all_tasks_df.loc[mask, "predecessor_ot"] = row.get("predecessor_ot", "")
+                        all_tasks_df.loc[mask, "forced_start"] = row.get("forced_start", "")
+                        all_tasks_df.loc[mask, "forced_team"] = row.get("forced_team", "")
+                        all_tasks_df.loc[mask, "selected_warning"] = row.get("selected_warning", "")
+                        all_tasks_df.loc[mask, "planned_start_at"] = row.get("planned_start_at", "")
+                        all_tasks_df.loc[mask, "planned_end_at"] = row.get("planned_end_at", "")
+                        all_tasks_df.loc[mask, "planned_team_name"] = row.get("planned_team_name", "")
+                        all_tasks_df.loc[mask, "commentaire"] = row.get("commentaire", "")
 
-                        all_tasks_df = st.session_state.get("wizard_tasks_df").copy()
-                        if generated_df is not None and not generated_df.empty:
-                            for _, row in generated_df.iterrows():
-                                mask = all_tasks_df["ot_id"] == row["ot_id"]
-                                cols = [
-                                    "selected_warning",
-                                    "planned_start_at",
-                                    "planned_end_at",
-                                    "planned_team_name",
-                                    "commentaire",
-                                ]
-                                for c in cols:
-                                    all_tasks_df.loc[mask, c] = row.get(c, "")
+                    _persist_generation(session, planning, all_tasks_df, teams_df)
 
-                        _persist_generation(session, planning, all_tasks_df, teams_df)
+                    st.session_state["wizard_generated_df"] = generated_selected_df.copy()
+                    st.session_state["wizard_unscheduled_df"] = unscheduled_df.copy() if unscheduled_df is not None else pd.DataFrame()
+                    st.session_state["wizard_tasks_df"] = all_tasks_df.copy()
 
-                        st.session_state["wizard_generated_df"] = generated_df.copy() if generated_df is not None else pd.DataFrame()
-                        st.session_state["wizard_unscheduled_df"] = unscheduled_df.copy() if unscheduled_df is not None else pd.DataFrame()
-                        st.session_state["wizard_tasks_df"] = all_tasks_df.copy()
+                    st.success("Planning genere et enregistre.")
+                    st.rerun()
 
-                        st.success("Planning genere et enregistre.")
-                        st.rerun()
+                except Exception as e:
+                    session.rollback()
+                    st.error(f"Erreur lors de la generation : {e}")
 
-                    except Exception as e:
-                        session.rollback()
-                        st.error(f"Erreur lors de la generation : {e}")
+            generated_df = st.session_state.get("wizard_generated_df")
+            unscheduled_df = st.session_state.get("wizard_unscheduled_df")
 
-                generated_df = st.session_state.get("wizard_generated_df")
-                unscheduled_df = st.session_state.get("wizard_unscheduled_df")
+            if generated_df is not None and not generated_df.empty:
+                planned_preview = generated_df[
+                    [
+                        "ot_id",
+                        "description",
+                        "atelier",
+                        "duration_hours",
+                        "planned_start_at",
+                        "planned_end_at",
+                        "planned_team_name",
+                        "commentaire",
+                    ]
+                ].copy()
 
-                if generated_df is not None and not generated_df.empty:
-                    planned_preview = generated_df[
-                        [
-                            "ot_id",
-                            "description",
-                            "atelier",
-                            "duration_hours",
-                            "planned_start_at",
-                            "planned_end_at",
-                            "planned_team_name",
-                            "commentaire",
-                        ]
-                    ].copy()
+                st.subheader("Planning genere")
+                st.dataframe(planned_preview, use_container_width=True, hide_index=True)
 
-                    st.subheader("Planning genere")
-                    st.dataframe(planned_preview, use_container_width=True, hide_index=True)
-
-                if unscheduled_df is not None and not unscheduled_df.empty:
-                    st.subheader("OT non planifies")
-                    st.dataframe(unscheduled_df, use_container_width=True, hide_index=True)
+            if unscheduled_df is not None and not unscheduled_df.empty:
+                st.subheader("OT non planifies")
+                st.dataframe(unscheduled_df, use_container_width=True, hide_index=True)
