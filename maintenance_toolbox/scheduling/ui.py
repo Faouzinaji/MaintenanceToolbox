@@ -15,10 +15,6 @@ from maintenance_toolbox.db import (
 )
 
 
-# =========================================================
-# Helpers généraux
-# =========================================================
-
 def _combine_date_time(d, hhmm: str):
     h, m = hhmm.split(":")
     return datetime.combine(d, time(int(h), int(m)))
@@ -112,10 +108,6 @@ def _parse_dt_any(value):
         return None
 
 
-# =========================================================
-# State wizard
-# =========================================================
-
 def _init_wizard_state():
     defaults = {
         "wizard_planning_id": None,
@@ -139,10 +131,6 @@ def _reset_wizard():
     st.session_state["wizard_tasks_df"] = None
     st.session_state["wizard_teams_df"] = None
 
-
-# =========================================================
-# DB helpers
-# =========================================================
 
 def _get_current_planning(session, planning_id):
     if not planning_id:
@@ -204,10 +192,6 @@ def _delete_planning(session, planning_id):
         session.delete(planning)
         session.commit()
 
-
-# =========================================================
-# Transform CSV -> tasks dataframe
-# =========================================================
 
 def _build_tasks_df_from_mapping(df, mapping):
     def col(key):
@@ -273,8 +257,8 @@ def _load_tasks_df_from_db(planning):
                 "selected": bool(t.selected),
                 "forced_team": t.forced_team_codes or "",
                 "predecessor_ot": t.predecessor_ot_id or "",
-                "forced_start": t.forced_start_at_text or "",
-                "duration_hours": t.duration_hours or 0.0,
+                "forced_start": str(t.forced_start_at) if t.forced_start_at else "",
+                "duration_hours": t.estimated_hours or 0.0,
                 "selected_warning": t.selected_warning or "",
                 "planned_start_at": str(t.planned_start_at) if t.planned_start_at else "",
                 "planned_end_at": str(t.planned_end_at) if t.planned_end_at else "",
@@ -317,10 +301,6 @@ def _load_teams_df_from_db(planning):
     return pd.DataFrame(rows)
 
 
-# =========================================================
-# Génération planning
-# =========================================================
-
 def _generate_schedule(tasks_df, teams_df, planning):
     result = tasks_df.copy()
 
@@ -350,7 +330,6 @@ def _generate_schedule(tasks_df, teams_df, planning):
         )
 
     selected_df = result[result["selected"]].copy()
-
     pending = selected_df.to_dict("records")
     scheduled_end_by_ot = {}
 
@@ -461,9 +440,6 @@ def _persist_generation(session, planning, tasks_df, teams_df):
         )
 
     for _, row in tasks_df.iterrows():
-        planned_start = _parse_dt_any(row["planned_start_at"])
-        planned_end = _parse_dt_any(row["planned_end_at"])
-
         session.add(
             PlanningTask(
                 planning_id=planning.id,
@@ -479,15 +455,14 @@ def _persist_generation(session, planning, tasks_df, teams_df):
                 created_by_source=_safe_text(row["created_by"]),
                 requested_week_source=_safe_text(row["requested_week"]),
                 condition_source=_safe_text(row["condition"]),
-                estimated_hours=float(row["estimated_hours"]) if str(row["estimated_hours"]).strip() else 0.0,
-                duration_hours=float(row["duration_hours"]) if str(row["duration_hours"]).strip() else 0.0,
+                estimated_hours=float(row["duration_hours"]) if str(row["duration_hours"]).strip() else 0.0,
                 selected=bool(row["selected"]),
                 selected_warning=_safe_text(row["selected_warning"]),
                 predecessor_ot_id=_safe_text(row["predecessor_ot"]),
                 forced_team_codes=_safe_text(row["forced_team"]),
-                forced_start_at_text=_safe_text(row["forced_start"]),
-                planned_start_at=planned_start,
-                planned_end_at=planned_end,
+                forced_start_at=_parse_dt_any(row["forced_start"]),
+                planned_start_at=_parse_dt_any(row["planned_start_at"]),
+                planned_end_at=_parse_dt_any(row["planned_end_at"]),
                 planned_team_name=_safe_text(row["planned_team_name"]),
             )
         )
@@ -498,10 +473,6 @@ def _persist_generation(session, planning, tasks_df, teams_df):
     session.commit()
     session.refresh(planning)
 
-
-# =========================================================
-# Charger planning existant dans le wizard
-# =========================================================
 
 def _load_planning_into_wizard(session, user, planning):
     st.session_state["wizard_planning_id"] = planning.id
@@ -535,10 +506,6 @@ def _load_planning_into_wizard(session, user, planning):
     else:
         st.session_state["wizard_active_section"] = 1
 
-
-# =========================================================
-# REX
-# =========================================================
 
 def _render_rex_panel(session, user, planning_id):
     planning = session.get(Planning, planning_id)
@@ -575,7 +542,7 @@ def _render_rex_panel(session, user, planning_id):
                 "atelier": t.atelier,
                 "planned_start_at": str(t.planned_start_at) if t.planned_start_at else "",
                 "planned_team_name": t.planned_team_name or "",
-                "rex_realized": t.rex_realized if t.rex_realized is not None else False,
+                "rex_done": bool(t.rex_done) if t.rex_done is not None else False,
                 "rex_cause_label": current_cause,
                 "rex_comment": t.rex_comment or "",
             }
@@ -594,7 +561,7 @@ def _render_rex_panel(session, user, planning_id):
             "atelier": st.column_config.TextColumn("Atelier", disabled=True),
             "planned_start_at": st.column_config.TextColumn("Début prévu", disabled=True),
             "planned_team_name": st.column_config.TextColumn("Équipe", disabled=True),
-            "rex_realized": st.column_config.CheckboxColumn("Réalisé"),
+            "rex_done": st.column_config.CheckboxColumn("Réalisé"),
             "rex_cause_label": st.column_config.SelectboxColumn("Cause", options=cause_options),
             "rex_comment": st.column_config.TextColumn("Commentaire"),
         },
@@ -609,13 +576,10 @@ def _render_rex_panel(session, user, planning_id):
                 if not task:
                     continue
 
-                task.rex_done = True
-                task.rex_realized = bool(row["rex_realized"])
+                task.rex_done = bool(row["rex_done"])
                 label = _safe_text(row["rex_cause_label"])
                 task.rex_cause_id = cause_label_to_id.get(label) if label else None
                 task.rex_comment = _safe_text(row["rex_comment"])
-                task.rex_recorded_at = datetime.now(timezone.utc)
-                task.rex_recorded_by_user_id = user.id
 
             session.commit()
             st.success("REX enregistré.")
@@ -623,10 +587,6 @@ def _render_rex_panel(session, user, planning_id):
             session.rollback()
             st.error(f"Erreur lors de l'enregistrement du REX : {e}")
 
-
-# =========================================================
-# UI principale Scheduling
-# =========================================================
 
 def render_scheduling_module(session, user):
     st.title("Scheduling")
@@ -639,9 +599,6 @@ def render_scheduling_module(session, user):
 
     tab1, tab2 = st.tabs(["Mes plannings", "Créer un planning"])
 
-    # =====================================================
-    # MES PLANNINGS
-    # =====================================================
     with tab1:
         st.subheader("Mes plannings")
 
@@ -696,9 +653,6 @@ def render_scheduling_module(session, user):
         except Exception as e:
             st.error(f"Erreur lors du chargement des plannings : {e}")
 
-    # =====================================================
-    # WIZARD
-    # =====================================================
     with tab2:
         planning = _get_current_planning(session, st.session_state["wizard_planning_id"])
 
@@ -717,9 +671,6 @@ def render_scheduling_module(session, user):
                 f"Période : **{planning.start_at} → {planning.end_at}**"
             )
 
-        # =================================================
-        # 1. PARAMÈTRES
-        # =================================================
         default_name = planning.name if planning else ""
         default_sectors = planning.sectors_csv if planning else ""
         default_start_date = planning.start_at.date() if planning else datetime.now().date()
@@ -805,9 +756,6 @@ def render_scheduling_module(session, user):
         if not planning:
             return
 
-        # =================================================
-        # 2. IMPORT CSV
-        # =================================================
         with st.expander(
             "2. Import CSV",
             expanded=st.session_state["wizard_active_section"] == 2,
@@ -868,9 +816,6 @@ def render_scheduling_module(session, user):
                 except Exception as e:
                     st.error(f"Erreur de lecture du CSV enregistré : {e}")
 
-        # =================================================
-        # 3. MAPPING
-        # =================================================
         with st.expander(
             "3. Mapping colonnes",
             expanded=st.session_state["wizard_active_section"] == 3,
@@ -938,16 +883,13 @@ def render_scheduling_module(session, user):
                 except Exception as e:
                     st.error(f"Erreur lors du mapping : {e}")
 
-        # =================================================
-        # 4. SÉLECTION OT
-        # =================================================
         with st.expander(
             "4. Sélection des OT",
             expanded=st.session_state["wizard_active_section"] == 4,
         ):
             tasks_df = st.session_state.get("wizard_tasks_df")
 
-            if tasks_df is None and planning.tasks:
+            if tasks_df is None and len(planning.tasks) > 0:
                 tasks_df = _load_tasks_df_from_db(planning)
                 st.session_state["wizard_tasks_df"] = tasks_df
 
@@ -1052,9 +994,6 @@ def render_scheduling_module(session, user):
                     st.success("Sélection OT enregistrée.")
                     st.rerun()
 
-        # =================================================
-        # 5. TEAMS
-        # =================================================
         with st.expander(
             "5. Teams",
             expanded=st.session_state["wizard_active_section"] == 5,
@@ -1066,7 +1005,7 @@ def render_scheduling_module(session, user):
             else:
                 teams_df = st.session_state.get("wizard_teams_df")
 
-                if (teams_df is None or teams_df.empty) and planning.teams:
+                if (teams_df is None or teams_df.empty) and len(planning.teams) > 0:
                     teams_df = _load_teams_df_from_db(planning)
                     st.session_state["wizard_teams_df"] = teams_df
 
@@ -1097,9 +1036,6 @@ def render_scheduling_module(session, user):
                     st.success("Équipes enregistrées.")
                     st.rerun()
 
-        # =================================================
-        # 6. GÉNÉRATION
-        # =================================================
         with st.expander(
             "6. Génération du planning",
             expanded=st.session_state["wizard_active_section"] == 6,
