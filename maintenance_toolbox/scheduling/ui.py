@@ -1,8 +1,9 @@
-from datetime import datetime, time, timezone
+from datetime import datetime, time, timezone, timedelta
 import csv
 import io
 import math
 import re
+import random
 
 import pandas as pd
 import streamlit as st
@@ -460,6 +461,8 @@ def _prepare_manual_actions_df(actions_df):
         return pd.DataFrame(columns=["task_id", "ot_id", "description", "equipment_desc", "equipment", "atelier", "duration_h", "predecessor_ot", "forced_start_dt", "forced_teams_list", "priority_score", "status", "slot_type"])
 
     df = actions_df.copy()
+    df["action_id"] = df["action_id"].replace("", pd.NA)
+    df["action_id"] = df["action_id"].fillna([f"ACT_{i+1}" for i in range(len(df))])
     df["task_id"] = df["action_id"].astype(str)
     df["ot_id"] = df["action_id"].astype(str)
     df["equipment_desc"] = ""
@@ -806,30 +809,56 @@ def _persist_generation(session, planning, all_tasks_df, teams_df):
     session.refresh(planning)
 
 
-def _load_planning_into_wizard(session, user, planning):
-    st.session_state["scheduling_view"] = "Creer un planning"
-    st.session_state["wizard_planning_id"] = planning.id
-    st.session_state["wizard_mapping"] = _load_saved_mapping(session, user.organization_id)
-    st.session_state["wizard_tasks_df"] = None
-    st.session_state["wizard_filtered_tasks_df"] = None
-    st.session_state["wizard_selected_df"] = None
-    st.session_state["wizard_teams_df"] = None
-    st.session_state["wizard_team_counts"] = {}
-    st.session_state["wizard_selected_ateliers"] = []
-    st.session_state["wizard_selected_secteurs"] = []
-    st.session_state["wizard_generated_df"] = None
-    st.session_state["wizard_unscheduled_df"] = None
-    st.session_state["wizard_current_atelier_idx"] = 0
-    st.session_state["wizard_slot_actions_df"] = None
+# =========================================================
+# DASHBOARD DEMO
+# =========================================================
 
-    if planning.csv_bytes:
-        st.session_state["wizard_active_section"] = 2
-    else:
-        st.session_state["wizard_active_section"] = 1
+def _build_demo_dashboard_data():
+    random.seed(42)
+    weeks = [f"2025-W{str(i).zfill(2)}" for i in range(44, 53)] + [f"2026-W{str(i).zfill(2)}" for i in range(1, 11)]
+
+    rows = []
+    for i, w in enumerate(weeks):
+        plan_respect = max(68, min(98, 82 + random.randint(-9, 10) + (i // 4)))
+        stop_window = max(70, min(99, 88 + random.randint(-11, 7)))
+        load_usage = max(52, min(97, 73 + random.randint(-14, 12)))
+
+        rows.append(
+            {
+                "Semaine": w,
+                "Taux respect planning (%)": plan_respect,
+                "Taux respect fenetre (%)": stop_window,
+                "Taux charge utilisee ATP (%)": load_usage,
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
+def _build_demo_ai_comment():
+    non_realized = [
+        "1674377 | Controle interne niveau conche filtre LB",
+        "1624551 | PLIC verification signal capteur",
+        "1547333 | Graissage 8 MC pompe",
+    ]
+    causes = [
+        "Manque de temps",
+        "Ressource indisponible",
+        "Attente production",
+    ]
+
+    comment = (
+        "Analyse AI – dernière semaine : le respect du planning reste sous pression malgré une bonne utilisation de la capacité. "
+        "Les OT non réalisés sont principalement liés à des arbitrages de fenêtre et à des indisponibilités de ressources. "
+        f"Les OT les plus pénalisants observés sont : {non_realized[0]}, {non_realized[1]} et {non_realized[2]}. "
+        f"Les causes dominantes sont : {causes[0]}, {causes[1]} et {causes[2]}. "
+        "Recommandation : sécuriser les ressources critiques en amont, verrouiller les prérequis de production et transformer les OT récurrents non réalisés en actions de fond."
+    )
+    return comment
 
 
 # =========================================================
-# REX
+# REX + ACTION PLAN
 # =========================================================
 
 def _render_rex_panel(session, user, planning_id):
@@ -841,6 +870,11 @@ def _render_rex_panel(session, user, planning_id):
     st.divider()
     st.subheader(f"Retour d'experience — {planning.name}")
 
+    selected_tasks = [t for t in planning.tasks if t.selected]
+    if not selected_tasks:
+        st.info("Aucun OT selectionne dans ce planning.")
+        return
+
     causes = session.scalars(
         select(RexCause)
         .where(RexCause.organization_id == user.organization_id)
@@ -848,92 +882,140 @@ def _render_rex_panel(session, user, planning_id):
         .order_by(RexCause.label_fr)
     ).all()
 
-    cause_label_to_id = {c.label_fr: c.id for c in causes}
-    cause_options = [""] + list(cause_label_to_id.keys())
+    cause_options = [""] + [c.label_fr for c in causes]
+    cause_map = {c.label_fr: c.id for c in causes}
 
-    selected_tasks = [t for t in planning.tasks if t.selected]
-
-    if not selected_tasks:
-        st.info("Aucun OT selectionne dans ce planning.")
-        return
-
-    rows = []
+    rex_rows = []
     for t in selected_tasks:
-        current_cause = t.rex_cause.label_fr if t.rex_cause else ""
-        rows.append(
+        current_label = ""
+        if getattr(t, "rex_cause_id", None):
+            for c in causes:
+                if c.id == t.rex_cause_id:
+                    current_label = c.label_fr
+                    break
+
+        rex_rows.append(
             {
                 "ot_id": t.external_ot_id,
                 "description": t.description,
                 "atelier": t.atelier,
                 "planned_start_at": str(t.planned_start_at) if t.planned_start_at else "",
                 "planned_team_name": t.planned_team_name or "",
-                "rex_done": bool(t.rex_done) if t.rex_done is not None else False,
-                "rex_cause_label": current_cause,
-                "rex_comment": t.rex_comment or "",
+                "realise": bool(t.rex_done) if t.rex_done is not None else False,
+                "cause": current_label,
+                "commentaire": t.rex_comment or "",
+                "action": "",
+                "responsable": "",
+                "delai": "",
             }
         )
 
-    rex_df = pd.DataFrame(rows)
+    rex_df = pd.DataFrame(rex_rows)
 
     edited = st.data_editor(
         rex_df,
         use_container_width=True,
         hide_index=True,
         num_rows="fixed",
+        key=f"rex_editor_{planning_id}",
         column_config={
             "ot_id": st.column_config.TextColumn("OT", disabled=True),
             "description": st.column_config.TextColumn("Description", disabled=True),
             "atelier": st.column_config.TextColumn("Atelier", disabled=True),
-            "planned_start_at": st.column_config.TextColumn("Debut prevu", disabled=True),
+            "planned_start_at": st.column_config.TextColumn("Début prévu", disabled=True),
             "planned_team_name": st.column_config.TextColumn("Equipe", disabled=True),
-            "rex_done": st.column_config.CheckboxColumn("Realise"),
-            "rex_cause_label": st.column_config.SelectboxColumn("Cause", options=cause_options),
-            "rex_comment": st.column_config.TextColumn("Commentaire"),
+            "realise": st.column_config.CheckboxColumn("Réalisé"),
+            "cause": st.column_config.SelectboxColumn("Cause", options=cause_options),
+            "commentaire": st.column_config.TextColumn("Commentaire"),
+            "action": st.column_config.TextColumn("Action"),
+            "responsable": st.column_config.TextColumn("Responsable"),
+            "delai": st.column_config.TextColumn("Délai"),
         },
-        key=f"rex_editor_{planning_id}",
     )
 
-    if st.button("Enregistrer le REX", use_container_width=True, key=f"save_rex_{planning_id}"):
+    if st.button("Enregistrer le REX", key=f"save_rex_{planning_id}", use_container_width=True):
         try:
+            # sauvegarde simple sur les champs existants
             for _, row in edited.iterrows():
                 ot_id = _safe_text(row["ot_id"])
                 task = next((x for x in selected_tasks if x.external_ot_id == ot_id), None)
                 if not task:
                     continue
 
-                task.rex_done = bool(row["rex_done"])
-                label = _safe_text(row["rex_cause_label"])
-                task.rex_cause_id = cause_label_to_id.get(label) if label else None
-                task.rex_comment = _safe_text(row["rex_comment"])
+                task.rex_done = bool(row["realise"])
+                label = _safe_text(row["cause"])
+                task.rex_cause_id = cause_map.get(label) if label else None
+                task.rex_comment = _safe_text(row["commentaire"])
 
             session.commit()
-            st.success("REX enregistre.")
+            st.success("REX enregistré.")
+
+            action_plan = edited[["ot_id", "action", "responsable", "delai"]].copy()
+            action_plan = action_plan[
+                (action_plan["action"].astype(str).str.strip() != "") |
+                (action_plan["responsable"].astype(str).str.strip() != "") |
+                (action_plan["delai"].astype(str).str.strip() != "")
+            ].copy()
+
+            if not action_plan.empty:
+                st.markdown("#### Plan d'action généré")
+                st.dataframe(action_plan, use_container_width=True, hide_index=True)
+
         except Exception as e:
             session.rollback()
             st.error(f"Erreur lors de l'enregistrement du REX : {e}")
 
 
 # =========================================================
-# UI
+# MAIN UI
 # =========================================================
 
 def render_scheduling_module(session, user):
     st.title("Scheduling")
 
     if not user.organization_id:
-        st.warning("Aucune organisation n'est associee a cet utilisateur.")
+        st.warning("Aucune organisation n'est associée à cet utilisateur.")
         return
 
     _init_wizard_state()
 
     st.radio(
         "Navigation Scheduling",
-        options=["Mes plannings", "Creer un planning"],
+        options=["Mes plannings", "Créer un planning", "Tableau de bord"],
         horizontal=True,
         label_visibility="collapsed",
         key="scheduling_view",
     )
 
+    # =====================================================
+    # DASHBOARD
+    # =====================================================
+    if st.session_state["scheduling_view"] == "Tableau de bord":
+        st.subheader("Tableau de bord")
+
+        dash_df = _build_demo_dashboard_data()
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Dernier respect planning", f"{int(dash_df.iloc[-1]['Taux respect planning (%)'])}%")
+        c2.metric("Dernier respect fenêtre", f"{int(dash_df.iloc[-1]['Taux respect fenetre (%)'])}%")
+        c3.metric("Dernière charge utilisée ATP", f"{int(dash_df.iloc[-1]['Taux charge utilisee ATP (%)'])}%")
+
+        st.markdown("#### Taux de respect du planning")
+        st.line_chart(dash_df.set_index("Semaine")[["Taux respect planning (%)"]], height=260)
+
+        st.markdown("#### Taux de respect de la fenêtre d'arrêt")
+        st.line_chart(dash_df.set_index("Semaine")[["Taux respect fenetre (%)"]], height=260)
+
+        st.markdown("#### Taux de charge utilisée ATP")
+        st.line_chart(dash_df.set_index("Semaine")[["Taux charge utilisee ATP (%)"]], height=260)
+
+        st.markdown("#### Commentaire AI – dernière semaine")
+        st.info(_build_demo_ai_comment())
+        return
+
+    # =====================================================
+    # MES PLANNINGS
+    # =====================================================
     if st.session_state["scheduling_view"] == "Mes plannings":
         st.subheader("Mes plannings")
 
@@ -955,19 +1037,20 @@ def render_scheduling_module(session, user):
                         st.markdown(
                             f"**{p.name}**  \n"
                             f"Statut : `{p.status}`  \n"
-                            f"Periode : {p.start_at} → {p.end_at}  \n"
+                            f"Période : {p.start_at} → {p.end_at}  \n"
                             f"CSV : {'Oui' if p.csv_filename else 'Non'}"
                         )
 
                     with c2:
                         if st.button("✏️", key=f"edit_{p.id}", use_container_width=True):
                             _load_planning_into_wizard(session, user, p)
+                            st.session_state["scheduling_view"] = "Créer un planning"
                             st.rerun()
 
                     with c3:
                         if st.button("🗑️", key=f"delete_{p.id}", use_container_width=True):
                             _delete_planning(session, p.id)
-                            st.success("Planning supprime.")
+                            st.success("Planning supprimé.")
                             st.rerun()
 
                     with c4:
@@ -985,11 +1068,14 @@ def render_scheduling_module(session, user):
 
         return
 
+    # =====================================================
+    # CREATE / EDIT PLANNING
+    # =====================================================
     planning = _get_current_planning(session, st.session_state["wizard_planning_id"])
 
     top_col1, top_col2 = st.columns([3, 1])
     with top_col1:
-        st.subheader("Wizard de creation / modification de planning")
+        st.subheader("Wizard de création / modification de planning")
     with top_col2:
         if st.button("Nouveau planning", key="new_planning_btn", use_container_width=True):
             _reset_wizard()
@@ -999,7 +1085,7 @@ def render_scheduling_module(session, user):
         st.info(
             f"Planning en cours : **{planning.name}** | "
             f"Statut : **{planning.status}** | "
-            f"Periode : **{planning.start_at} → {planning.end_at}**"
+            f"Période : **{planning.start_at} → {planning.end_at}**"
         )
 
     default_name = planning.name if planning else ""
@@ -1009,20 +1095,20 @@ def render_scheduling_module(session, user):
     default_daily_open = planning.daily_open if planning else "07:00"
     default_daily_close = planning.daily_close if planning else "15:00"
 
-    with st.expander("1. Parametres de l'arret", expanded=st.session_state["wizard_active_section"] == 1):
+    with st.expander("1. Paramètres de l'arrêt", expanded=st.session_state["wizard_active_section"] == 1):
         with st.form("create_planning_form"):
             name = st.text_input("Nom du planning", value=default_name)
-            sectors_txt = st.text_input("Secteurs (separes par des virgules)", value=default_sectors)
+            sectors_txt = st.text_input("Secteurs (séparés par des virgules)", value=default_sectors)
 
             col1, col2 = st.columns(2)
             with col1:
-                start_date = st.date_input("Date de debut", value=default_start_date)
+                start_date = st.date_input("Date de début", value=default_start_date)
                 daily_open = st.text_input("Heure d'ouverture", value=default_daily_open)
             with col2:
                 end_date = st.date_input("Date de fin", value=default_end_date)
                 daily_close = st.text_input("Heure de fermeture", value=default_daily_close)
 
-            submitted = st.form_submit_button("Valider les parametres", use_container_width=True)
+            submitted = st.form_submit_button("Valider les paramètres", use_container_width=True)
 
         if submitted:
             try:
@@ -1060,7 +1146,7 @@ def render_scheduling_module(session, user):
 
             except Exception as e:
                 session.rollback()
-                st.error(f"Erreur lors de l'enregistrement des parametres : {e}")
+                st.error(f"Erreur lors de l'enregistrement des paramètres : {e}")
 
     planning = _get_current_planning(session, st.session_state["wizard_planning_id"])
     if not planning:
@@ -1090,7 +1176,7 @@ def render_scheduling_module(session, user):
             try:
                 local_df = _read_csv_safely(planning.csv_bytes)
             except Exception as e:
-                st.error(f"Erreur de lecture du CSV enregistre : {e}")
+                st.error(f"Erreur de lecture du CSV enregistré : {e}")
 
         if local_df is not None:
             columns = list(local_df.columns)
@@ -1105,11 +1191,11 @@ def render_scheduling_module(session, user):
                 ("secteur", "Secteur"),
                 ("equipment", "Equipement"),
                 ("equipment_desc", "Description equipement"),
-                ("created_at", "Cree le"),
-                ("created_by", "Cree par"),
-                ("requested_week", "Sem. souhaitee"),
-                ("condition", "Condition realisation"),
-                ("estimated_hours", "Duree estimee"),
+                ("created_at", "Créé le"),
+                ("created_by", "Créé par"),
+                ("requested_week", "Sem. souhaitée"),
+                ("condition", "Condition réalisation"),
+                ("estimated_hours", "Durée estimée"),
             ]
 
             with st.form("mapping_form"):
@@ -1133,7 +1219,7 @@ def render_scheduling_module(session, user):
                     st.session_state["wizard_active_section"] = 3
                     st.rerun()
 
-    with st.expander("3. Selection ateliers / secteurs", expanded=st.session_state["wizard_active_section"] == 3):
+    with st.expander("3. Sélection ateliers / secteurs", expanded=st.session_state["wizard_active_section"] == 3):
         tasks_df = st.session_state.get("wizard_tasks_df")
 
         if tasks_df is None:
@@ -1144,12 +1230,12 @@ def render_scheduling_module(session, user):
 
             with st.form("scope_form"):
                 selected_ateliers = st.multiselect(
-                    "Ateliers selectionnes",
+                    "Ateliers sélectionnés",
                     options=ateliers,
                     default=st.session_state["wizard_selected_ateliers"] or ateliers,
                 )
                 selected_secteurs = st.multiselect(
-                    "Secteurs selectionnes",
+                    "Secteurs sélectionnés",
                     options=secteurs,
                     default=st.session_state["wizard_selected_secteurs"] or secteurs,
                 )
@@ -1182,10 +1268,10 @@ def render_scheduling_module(session, user):
                 total_hours = float(atelier_df["duration_hours"].sum()) if not atelier_df.empty else 0.0
                 theoretical = max(1, math.ceil(total_hours / stop_hours)) if total_hours > 0 else 1
 
-                st.markdown(f"**{atelier}** — charge calculee : {round(total_hours,1)} h")
+                st.markdown(f"**{atelier}** — charge calculée : {round(total_hours,1)} h")
 
                 nb_equipes = st.number_input(
-                    f"{atelier} - nombre d'equipes disponibles",
+                    f"{atelier} - nombre d'équipes disponibles",
                     min_value=0,
                     max_value=max(20, theoretical + 10),
                     value=int(st.session_state["wizard_team_counts"].get(atelier, theoretical)),
@@ -1202,7 +1288,6 @@ def render_scheduling_module(session, user):
                             start_dt=_normalize_ts(planning.start_at),
                             end_dt=_normalize_ts(planning.end_at),
                         )
-                        roster_df["label"] = roster_df["code"] + " | " + roster_df["name"]
                         edited_roster = st.data_editor(
                             roster_df[["atelier", "code", "name", "available_from", "available_to"]],
                             use_container_width=True,
@@ -1213,15 +1298,15 @@ def render_scheduling_module(session, user):
                                 "atelier": st.column_config.TextColumn("Atelier", disabled=True),
                                 "code": st.column_config.TextColumn("Code equipe"),
                                 "name": st.column_config.TextColumn("Nom equipe"),
-                                "available_from": st.column_config.TextColumn("Debut disponibilite"),
-                                "available_to": st.column_config.TextColumn("Fin disponibilite"),
+                                "available_from": st.column_config.TextColumn("Début disponibilité"),
+                                "available_to": st.column_config.TextColumn("Fin disponibilité"),
                             },
                         )
                         all_rosters.append(edited_roster.copy())
                     else:
-                        st.info("Aucune equipe pour cet atelier.")
+                        st.info("Aucune équipe pour cet atelier.")
 
-            if st.button("Valider les equipes", key="validate_teams_btn", use_container_width=True):
+            if st.button("Valider les équipes", key="validate_teams_btn", use_container_width=True):
                 st.session_state["wizard_teams_df"] = (
                     pd.concat(all_rosters, ignore_index=True)
                     if all_rosters
@@ -1231,13 +1316,13 @@ def render_scheduling_module(session, user):
                 st.session_state["wizard_active_section"] = 5
                 st.rerun()
 
-    with st.expander("5. Selection des OT par atelier", expanded=st.session_state["wizard_active_section"] == 5):
+    with st.expander("5. Sélection des OT par atelier", expanded=st.session_state["wizard_active_section"] == 5):
         filtered_df = st.session_state.get("wizard_filtered_tasks_df")
         teams_df = st.session_state.get("wizard_teams_df")
         selected_ateliers = st.session_state.get("wizard_selected_ateliers", [])
 
         if filtered_df is None or teams_df is None or not selected_ateliers:
-            st.info("Valide d'abord les equipes.")
+            st.info("Valide d'abord les équipes.")
         else:
             for idx, atelier in enumerate(selected_ateliers):
                 store_key = f"atelier_selection_{_safe_key(atelier)}"
@@ -1252,7 +1337,7 @@ def render_scheduling_module(session, user):
                 selected_hours = float(work_df.loc[work_df["selected"] == True, "duration_hours"].sum()) if not work_df.empty else 0.0
 
                 expanded = idx == st.session_state.get("wizard_current_atelier_idx", 0)
-                with st.expander(f"{atelier} — charge selectionnee : {round(selected_hours,1)} h", expanded=expanded):
+                with st.expander(f"{atelier} — charge sélectionnée : {round(selected_hours,1)} h", expanded=expanded):
                     with st.form(f"atelier_main_form_{_safe_key(atelier)}"):
                         display_df = work_df[
                             ["selected", "ot_id", "description", "equipment_desc", "status", "duration_hours"]
@@ -1272,11 +1357,11 @@ def render_scheduling_module(session, user):
                                 "description": st.column_config.TextColumn("Description", disabled=True),
                                 "equipment_desc": st.column_config.TextColumn("Equipement", disabled=True),
                                 "status": st.column_config.TextColumn("Statut", disabled=True),
-                                "duration_hours": st.column_config.NumberColumn("Duree retenue (h)", min_value=0.0, step=0.5),
+                                "duration_hours": st.column_config.NumberColumn("Durée retenue (h)", min_value=0.0, step=0.5),
                             },
                         )
 
-                        validate_selection = st.form_submit_button("Valider la selection", use_container_width=True)
+                        validate_selection = st.form_submit_button("Valider la sélection", use_container_width=True)
 
                     if validate_selection:
                         tmp = work_df.copy()
@@ -1293,7 +1378,7 @@ def render_scheduling_module(session, user):
                     selected_rows = st.session_state[store_key][st.session_state[store_key]["selected"] == True].copy()
 
                     if not selected_rows.empty:
-                        st.markdown("#### Contraintes des OT selectionnes")
+                        st.markdown("#### Contraintes des OT sélectionnés")
 
                         roster = teams_df[teams_df["atelier"] == atelier].copy()
                         team_options = []
@@ -1330,7 +1415,7 @@ def render_scheduling_module(session, user):
                                     current_pred = _safe_text(r.get("predecessor_ot", ""))
 
                                     pred_val = st.selectbox(
-                                        f"Predecesseur pour OT {ot_id}",
+                                        f"Prédécesseur pour OT {ot_id}",
                                         options=pred_options,
                                         index=pred_options.index(current_pred) if current_pred in pred_options else 0,
                                         format_func=lambda x: "Aucun" if x == "" else pred_labels.get(x, x),
@@ -1345,13 +1430,13 @@ def render_scheduling_module(session, user):
                                     c1, c2 = st.columns(2)
                                     with c1:
                                         forced_date = st.date_input(
-                                            f"Date forcee pour OT {ot_id}",
+                                            f"Date forcée pour OT {ot_id}",
                                             value=default_date,
                                             key=f"forced_date_{_safe_key(atelier)}_{ot_id}"
                                         )
                                     with c2:
                                         forced_time = st.time_input(
-                                            f"Heure forcee pour OT {ot_id}",
+                                            f"Heure forcée pour OT {ot_id}",
                                             value=default_time,
                                             key=f"forced_time_{_safe_key(atelier)}_{ot_id}"
                                         )
@@ -1367,7 +1452,7 @@ def render_scheduling_module(session, user):
                                             current_teams_display.append(disp)
 
                                     forced_team_sel = st.multiselect(
-                                        f"Equipes forcees pour OT {ot_id}",
+                                        f"Equipes forcées pour OT {ot_id}",
                                         options=team_options,
                                         default=current_teams_display,
                                         key=f"fteams_{_safe_key(atelier)}_{ot_id}"
@@ -1395,7 +1480,7 @@ def render_scheduling_module(session, user):
                                 st.session_state["wizard_current_atelier_idx"] = idx + 1
                             st.rerun()
 
-            if st.button("Finaliser la selection des OT", key="finalize_ot_btn", use_container_width=True):
+            if st.button("Finaliser la sélection des OT", key="finalize_ot_btn", use_container_width=True):
                 final_frames = []
                 for at in selected_ateliers:
                     sk = f"atelier_selection_{_safe_key(at)}"
@@ -1409,21 +1494,21 @@ def render_scheduling_module(session, user):
                 st.session_state["wizard_active_section"] = 6
                 st.rerun()
 
-    with st.expander("6. Generation du planning", expanded=st.session_state["wizard_active_section"] == 6):
+    with st.expander("6. Génération du planning", expanded=st.session_state["wizard_active_section"] == 6):
         selected_df = st.session_state.get("wizard_selected_df")
         teams_df = st.session_state.get("wizard_teams_df")
 
         if selected_df is None or teams_df is None:
-            st.info("Valide d'abord la selection OT et les equipes.")
+            st.info("Valide d'abord la sélection OT et les équipes.")
         else:
             coactivity_df = _build_coactivity_df(selected_df)
-            st.markdown("#### Coactivites detectees")
+            st.markdown("#### Coactivités détectées")
             if coactivity_df.empty:
-                st.info("Aucune coactivite detectee.")
+                st.info("Aucune coactivité détectée.")
             else:
                 st.dataframe(coactivity_df, use_container_width=True, hide_index=True)
 
-            st.markdown("#### Actions manuelles a inserer")
+            st.markdown("#### Actions manuelles à insérer")
             actions_default = pd.DataFrame(
                 columns=["action_id", "slot_type", "description", "atelier", "duration_hours", "forced_start", "forced_team"]
             )
@@ -1441,9 +1526,9 @@ def render_scheduling_module(session, user):
                     "slot_type": st.column_config.SelectboxColumn("Type", options=["START", "END", "DURING"]),
                     "description": st.column_config.TextColumn("Description"),
                     "atelier": st.column_config.SelectboxColumn("Atelier", options=st.session_state.get("wizard_selected_ateliers", [])),
-                    "duration_hours": st.column_config.NumberColumn("Duree (h)", min_value=0.0, step=0.5),
-                    "forced_start": st.column_config.TextColumn("Debut force (YYYY-MM-DD HH:MM)"),
-                    "forced_team": st.column_config.TextColumn("Equipe forcee (code)"),
+                    "duration_hours": st.column_config.NumberColumn("Durée (h)", min_value=0.0, step=0.5),
+                    "forced_start": st.column_config.TextColumn("Début forcé (YYYY-MM-DD HH:MM)"),
+                    "forced_team": st.column_config.TextColumn("Equipe forcée (code)"),
                 },
             )
             st.session_state["wizard_slot_actions_df"] = edited_actions.copy()
@@ -1458,9 +1543,9 @@ def render_scheduling_module(session, user):
             total_capacity_hours = float(sum(len(teams_df[teams_df["atelier"] == a]) * stop_hours for a in selected_ateliers))
 
             c1, c2, c3 = st.columns(3)
-            c1.metric("OT selectionnes", len(selected_df))
-            c2.metric("Charge selectionnee (h)", round(total_selected_hours, 1))
-            c3.metric("Capacite theorique totale (h)", round(total_capacity_hours, 1))
+            c1.metric("OT sélectionnés", len(selected_df))
+            c2.metric("Charge sélectionnée (h)", round(total_selected_hours, 1))
+            c3.metric("Capacité théorique totale (h)", round(total_capacity_hours, 1))
 
             if st.button("Generer et enregistrer le planning", key="generate_planning_btn", type="primary", use_container_width=True):
                 try:
@@ -1499,19 +1584,19 @@ def render_scheduling_module(session, user):
                     st.session_state["wizard_manual_generated_df"] = manual_result.copy() if manual_result is not None else pd.DataFrame()
                     st.session_state["wizard_tasks_df"] = all_tasks_df.copy()
 
-                    st.success("Planning genere et enregistre.")
+                    st.success("Planning généré et enregistré.")
                     st.rerun()
 
                 except Exception as e:
                     session.rollback()
-                    st.error(f"Erreur lors de la generation : {e}")
+                    st.error(f"Erreur lors de la génération : {e}")
 
             generated_df = st.session_state.get("wizard_generated_df")
             unscheduled_df = st.session_state.get("wizard_unscheduled_df")
             manual_generated_df = st.session_state.get("wizard_manual_generated_df")
 
             if generated_df is not None and not generated_df.empty:
-                st.subheader("Planning genere")
+                st.subheader("Planning généré")
                 st.dataframe(
                     generated_df[
                         [
@@ -1530,10 +1615,10 @@ def render_scheduling_module(session, user):
                 )
 
             if manual_generated_df is not None and not manual_generated_df.empty:
-                st.subheader("Actions manuelles planifiees")
+                st.subheader("Actions manuelles planifiées")
                 show_cols = [c for c in ["ot_id", "description", "atelier", "duration_h", "planned_start_at", "planned_end_at", "planned_team_name"] if c in manual_generated_df.columns]
                 st.dataframe(manual_generated_df[show_cols], use_container_width=True, hide_index=True)
 
             if unscheduled_df is not None and not unscheduled_df.empty:
-                st.subheader("OT non planifies")
+                st.subheader("OT non planifiés")
                 st.dataframe(unscheduled_df, use_container_width=True, hide_index=True)
