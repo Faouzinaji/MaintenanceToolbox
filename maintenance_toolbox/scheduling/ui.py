@@ -1,4 +1,4 @@
-from datetime import datetime, time, timezone, timedelta
+from datetime import datetime, time, timezone
 import csv
 import io
 import math
@@ -462,7 +462,9 @@ def _prepare_manual_actions_df(actions_df):
 
     df = actions_df.copy()
     df["action_id"] = df["action_id"].replace("", pd.NA)
-    df["action_id"] = df["action_id"].fillna([f"ACT_{i+1}" for i in range(len(df))])
+    if len(df) > 0:
+        fallback_ids = [f"ACT_{i+1}" for i in range(len(df))]
+        df["action_id"] = df["action_id"].fillna(pd.Series(fallback_ids, index=df.index))
     df["task_id"] = df["action_id"].astype(str)
     df["ot_id"] = df["action_id"].astype(str)
     df["equipment_desc"] = ""
@@ -815,14 +817,13 @@ def _persist_generation(session, planning, all_tasks_df, teams_df):
 
 def _build_demo_dashboard_data():
     random.seed(42)
-    weeks = [f"2025-W{str(i).zfill(2)}" for i in range(44, 53)] + [f"2026-W{str(i).zfill(2)}" for i in range(1, 11)]
+    weeks = [f"2025-W{str(i).zfill(2)}" for i in range(48, 53)] + [f"2026-W{str(i).zfill(2)}" for i in range(1, 9)]
 
     rows = []
     for i, w in enumerate(weeks):
         plan_respect = max(68, min(98, 82 + random.randint(-9, 10) + (i // 4)))
         stop_window = max(70, min(99, 88 + random.randint(-11, 7)))
         load_usage = max(52, min(97, 73 + random.randint(-14, 12)))
-
         rows.append(
             {
                 "Semaine": w,
@@ -832,6 +833,22 @@ def _build_demo_dashboard_data():
             }
         )
 
+    return pd.DataFrame(rows)
+
+
+def _build_demo_causes_df(weeks):
+    random.seed(7)
+    rows = []
+    for w in weeks:
+        rows.append(
+            {
+                "Semaine": w,
+                "Manque de temps": random.randint(1, 5),
+                "Ressource indisponible": random.randint(0, 4),
+                "Attente production": random.randint(0, 4),
+                "Pièce indisponible": random.randint(0, 3),
+            }
+        )
     return pd.DataFrame(rows)
 
 
@@ -933,9 +950,21 @@ def _render_rex_panel(session, user, planning_id):
         },
     )
 
+    st.markdown("#### Horaires réels de l'arrêt")
+    c1, c2 = st.columns(2)
+    with c1:
+        effective_start = st.text_input(
+            "Heure de démarrage effective (YYYY-MM-DD HH:MM)",
+            key=f"rex_effective_start_{planning_id}",
+        )
+    with c2:
+        effective_end = st.text_input(
+            "Heure d'arrêt effective / fin effective (YYYY-MM-DD HH:MM)",
+            key=f"rex_effective_end_{planning_id}",
+        )
+
     if st.button("Enregistrer le REX", key=f"save_rex_{planning_id}", use_container_width=True):
         try:
-            # sauvegarde simple sur les champs existants
             for _, row in edited.iterrows():
                 ot_id = _safe_text(row["ot_id"])
                 task = next((x for x in selected_tasks if x.external_ot_id == ot_id), None)
@@ -949,6 +978,11 @@ def _render_rex_panel(session, user, planning_id):
 
             session.commit()
             st.success("REX enregistré.")
+
+            if effective_start or effective_end:
+                st.markdown(
+                    f"**Fenêtre réelle enregistrée pour démo** : démarrage = `{effective_start or '-'}` | fin = `{effective_end or '-'}`"
+                )
 
             action_plan = edited[["ot_id", "action", "responsable", "delai"]].copy()
             action_plan = action_plan[
@@ -994,20 +1028,46 @@ def render_scheduling_module(session, user):
         st.subheader("Tableau de bord")
 
         dash_df = _build_demo_dashboard_data()
+        causes_df = _build_demo_causes_df(dash_df["Semaine"].tolist())
 
         c1, c2, c3 = st.columns(3)
         c1.metric("Dernier respect planning", f"{int(dash_df.iloc[-1]['Taux respect planning (%)'])}%")
         c2.metric("Dernier respect fenêtre", f"{int(dash_df.iloc[-1]['Taux respect fenetre (%)'])}%")
         c3.metric("Dernière charge utilisée ATP", f"{int(dash_df.iloc[-1]['Taux charge utilisee ATP (%)'])}%")
 
-        st.markdown("#### Taux de respect du planning")
-        st.line_chart(dash_df.set_index("Semaine")[["Taux respect planning (%)"]], height=260)
+        r1c1, r1c2 = st.columns(2)
+        with r1c1:
+            st.markdown("#### Respect du planning")
+            st.line_chart(
+                dash_df.set_index("Semaine")[["Taux respect planning (%)"]],
+                height=220,
+                use_container_width=True,
+            )
 
-        st.markdown("#### Taux de respect de la fenêtre d'arrêt")
-        st.line_chart(dash_df.set_index("Semaine")[["Taux respect fenetre (%)"]], height=260)
+        with r1c2:
+            st.markdown("#### Respect de la fenêtre d'arrêt")
+            st.line_chart(
+                dash_df.set_index("Semaine")[["Taux respect fenetre (%)"]],
+                height=220,
+                use_container_width=True,
+            )
 
-        st.markdown("#### Taux de charge utilisée ATP")
-        st.line_chart(dash_df.set_index("Semaine")[["Taux charge utilisee ATP (%)"]], height=260)
+        r2c1, r2c2 = st.columns(2)
+        with r2c1:
+            st.markdown("#### Charge utilisée ATP")
+            st.line_chart(
+                dash_df.set_index("Semaine")[["Taux charge utilisee ATP (%)"]],
+                height=220,
+                use_container_width=True,
+            )
+
+        with r2c2:
+            st.markdown("#### Causes de non-respect du planning")
+            st.bar_chart(
+                causes_df.set_index("Semaine"),
+                height=220,
+                use_container_width=True,
+            )
 
         st.markdown("#### Commentaire AI – dernière semaine")
         st.info(_build_demo_ai_comment())
