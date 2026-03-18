@@ -4,11 +4,11 @@ from maintenance_toolbox.db import init_db, SessionLocal
 from maintenance_toolbox.auth import render_login, get_current_user, logout_user
 from maintenance_toolbox.home import render_home
 from maintenance_toolbox.admin_ui import render_admin
-from maintenance_toolbox.scheduling.ui import render_scheduling_module
+from maintenance_toolbox.meetings.hub import render_meeting_hub
 from maintenance_toolbox.settings_ui import render_settings
 
 
-st.set_page_config(page_title="MaintenanceToolbox", layout="wide")
+st.set_page_config(page_title="MaintenanceHub", layout="wide")
 
 st.markdown(
     """
@@ -20,13 +20,9 @@ st.markdown(
         --mn-soft: #ead7b0;
     }
 
-    .stApp {
-        background-color: white;
-    }
+    .stApp { background-color: white; }
 
-    h1, h2, h3 {
-        color: var(--mn-dark);
-    }
+    h1, h2, h3 { color: var(--mn-dark); }
 
     .stButton > button {
         border-radius: 10px;
@@ -39,22 +35,19 @@ st.markdown(
         border: 1px solid var(--mn-orange);
     }
 
-    div[data-testid="stMetricValue"] {
-        color: var(--mn-dark);
-    }
+    div[data-testid="stMetricValue"] { color: var(--mn-dark); }
 
     div[data-testid="stExpander"] details summary {
         color: var(--mn-dark);
         font-weight: 600;
     }
 
-    .mn-banner {
-        background: #f8f3e8;
-        border-left: 6px solid var(--mn-orange);
-        padding: 12px 16px;
-        border-radius: 8px;
-        color: var(--mn-dark);
-        margin-bottom: 12px;
+    /* Top nav active state */
+    .nav-active > button {
+        background: #fff3e0 !important;
+        border-color: var(--mn-orange) !important;
+        color: var(--mn-orange) !important;
+        font-weight: 700 !important;
     }
     </style>
     """,
@@ -77,37 +70,52 @@ with SessionLocal() as session:
         render_login(session)
         st.stop()
 
-    c1, c2, c3, c4, c5 = st.columns([1.2, 1.4, 1.2, 1.2, 8])
+    # ── Top navigation ─────────────────────────────────────
+    page = st.session_state["page"]
 
-    with c1:
-        if st.button("🏠 Accueil", key="top_home", use_container_width=True):
+    nav_cols = st.columns([1.4, 1.2, 1.2, 1.2, 1.2, 8])
+
+    with nav_cols[0]:
+        active_cls = "nav-active" if page == "home" else ""
+        st.markdown(f'<div class="{active_cls}">', unsafe_allow_html=True)
+        if st.button("🏭 Cockpit", key="top_home", use_container_width=True):
             st.session_state["page"] = "home"
             st.rerun()
+        st.markdown("</div>", unsafe_allow_html=True)
 
-    with c2:
-        if st.button("📅 Scheduling", key="top_scheduling", use_container_width=True):
-            st.session_state["page"] = "scheduling"
-            st.rerun()
+    with nav_cols[1]:
+        if user.role == "admin":
+            active_cls = "nav-active" if page == "admin" else ""
+            st.markdown(f'<div class="{active_cls}">', unsafe_allow_html=True)
+            if st.button("🛠️ Admin", key="top_admin", use_container_width=True):
+                st.session_state["page"] = "admin"
+                st.rerun()
+            st.markdown("</div>", unsafe_allow_html=True)
 
-    with c3:
-        if st.button("⚙️ Settings", key="top_settings", use_container_width=True):
+    with nav_cols[2]:
+        active_cls = "nav-active" if page == "settings" else ""
+        st.markdown(f'<div class="{active_cls}">', unsafe_allow_html=True)
+        if st.button("⚙️ Paramètres", key="top_settings", use_container_width=True):
             st.session_state["page"] = "settings"
             st.rerun()
+        st.markdown("</div>", unsafe_allow_html=True)
 
-    with c4:
-        if st.button("🚪 Logout", key="top_logout", use_container_width=True):
+    with nav_cols[3]:
+        if st.button("🚪 Déconnexion", key="top_logout", use_container_width=True):
             logout_user()
             st.rerun()
 
     st.divider()
 
-    page = st.session_state["page"]
-
+    # ── Page routing ────────────────────────────────────────
     if page == "home":
-        render_home(user)
-    elif page == "scheduling":
-        render_scheduling_module(session, user)
+        render_home(user, session)
+
+    elif page == "meeting_hub":
+        render_meeting_hub(session, user)
+
     elif page == "settings":
         render_settings(session, user)
+
     elif page == "admin":
         render_admin(session, user)
