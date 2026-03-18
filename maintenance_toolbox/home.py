@@ -16,14 +16,49 @@ from maintenance_toolbox.meetings.common import effective_status, _to_utc, FREQ_
 def render_home(user, db_session) -> None:
     org_id = user.organization_id
 
-    # Load meeting types
-    all_types = db_session.scalars(
-        select(MeetingType).order_by(MeetingType.order_index)
-    ).all()
+    # ── Single data-loading pass (4 queries, no N+1) ────────────────────────
+    with st.spinner("Chargement du cockpit…"):
+        all_types = db_session.scalars(
+            select(MeetingType).order_by(MeetingType.order_index)
+        ).all()
+
+        all_instances = db_session.scalars(
+            select(MeetingInstance).where(MeetingInstance.organization_id == org_id)
+        ).all()
+
+        inst_ids = [i.id for i in all_instances]
+
+        all_sessions = (
+            db_session.scalars(
+                select(MeetingSession)
+                .where(MeetingSession.instance_id.in_(inst_ids))
+                .order_by(MeetingSession.created_at.desc())
+            ).all()
+            if inst_ids else []
+        )
+
+        all_actions = db_session.scalars(
+            select(Action).where(Action.organization_id == org_id)
+        ).all()
+
+    # ── In-memory lookup maps (no more DB calls below) ───────────────────────
+    sessions_by_instance: dict[int, list[MeetingSession]] = {}
+    for ms in all_sessions:
+        sessions_by_instance.setdefault(ms.instance_id, []).append(ms)
+
+    actions_by_session: dict[int, list[Action]] = {}
+    for a in all_actions:
+        if a.meeting_session_id:
+            actions_by_session.setdefault(a.meeting_session_id, []).append(a)
+
+    instances_by_type: dict[int, list[MeetingInstance]] = {}
+    for inst in all_instances:
+        instances_by_type.setdefault(inst.meeting_type_id, []).append(inst)
+
     active_types = [mt for mt in all_types if mt.active]
     inactive_types = [mt for mt in all_types if not mt.active]
 
-    # Header
+    # ── Header ────────────────────────────────────────────────────────────────
     st.markdown(
         f"""<div style="margin-bottom:24px;">
         <h1 style="color:#3f434f;margin-bottom:4px;">🏭 MaintenanceHub</h1>
@@ -32,12 +67,11 @@ def render_home(user, db_session) -> None:
         unsafe_allow_html=True,
     )
 
-    # Global KPI strip
-    _render_kpi_strip(db_session, org_id)
-
+    # ── KPI strip ─────────────────────────────────────────────────────────────
+    _render_kpi_strip(all_instances, all_sessions, all_actions)
     st.divider()
 
-    # ── Active meetings ─────────────────────────────────────
+    # ── Active meetings ───────────────────────────────────────────────────────
     st.markdown(
         """<div style="display:flex;align-items:center;gap:12px;margin-bottom:16px;">
         <div style="width:5px;height:28px;background:#f39200;border-radius:3px;"></div>
@@ -50,13 +84,18 @@ def render_home(user, db_session) -> None:
         cols = st.columns(len(active_types))
         for col, mt in zip(cols, active_types):
             with col:
-                _render_active_card(db_session, mt, org_id)
+                _render_active_card(
+                    mt,
+                    instances_by_type.get(mt.id, []),
+                    sessions_by_instance,
+                    actions_by_session,
+                )
     else:
         st.info("Aucun type de réunion actif configuré.")
 
     st.divider()
 
-    # ── Inactive meetings ────────────────────────────────────
+    # ── Inactive meetings ─────────────────────────────────────────────────────
     st.markdown(
         """<div style="display:flex;align-items:center;gap:12px;margin-bottom:16px;">
         <div style="width:5px;height:28px;background:#aaa;border-radius:3px;"></div>
@@ -66,7 +105,6 @@ def render_home(user, db_session) -> None:
     )
 
     if inactive_types:
-        # Show up to 5 per row
         cols = st.columns(min(len(inactive_types), 5))
         for col, mt in zip(cols, inactive_types):
             with col:
@@ -74,22 +112,14 @@ def render_home(user, db_session) -> None:
 
 
 # ─────────────────────────────────────────────────────────
-#  KPI STRIP
+#  KPI STRIP — pure in-memory, no DB calls
 # ─────────────────────────────────────────────────────────
 
-def _render_kpi_strip(db_session, org_id: int) -> None:
-    all_instances = db_session.scalars(
-        select(MeetingInstance).where(MeetingInstance.organization_id == org_id)
-    ).all()
-    all_sessions = db_session.scalars(
-        select(MeetingSession).join(MeetingInstance).where(
-            MeetingInstance.organization_id == org_id
-        )
-    ).all()
-    all_actions = db_session.scalars(
-        select(Action).where(Action.organization_id == org_id)
-    ).all()
-
+def _render_kpi_strip(
+    all_instances: list,
+    all_sessions: list,
+    all_actions: list,
+) -> None:
     closed_sessions = [s for s in all_sessions if s.status == "closed"]
     tenue = (
         round(len(closed_sessions) / len(all_instances) * 100)
@@ -104,42 +134,41 @@ def _render_kpi_strip(db_session, org_id: int) -> None:
 
     c1, c2, c3, c4, c5 = st.columns(5)
     with c1:
-        st.metric("📅 Réunions", len(all_instances), help="Instances créées au total")
+        st.metric("📅 Réunions", len(all_instances))
     with c2:
-        tenue_delta = f"{tenue}% tenue" if tenue else None
         st.metric("✅ Sessions clôturées", len(closed_sessions))
     with c3:
         st.metric("🎯 Taux de tenue", f"{tenue}%")
     with c4:
-        st.metric("⚡ Actions ouvertes", open_actions, delta=f"-{late_actions} en retard" if late_actions else None, delta_color="inverse")
+        st.metric(
+            "⚡ Actions ouvertes", open_actions,
+            delta=f"-{late_actions} en retard" if late_actions else None,
+            delta_color="inverse",
+        )
     with c5:
         st.metric("📊 Taux de clôture", f"{closure_rate}%")
 
 
 # ─────────────────────────────────────────────────────────
-#  ACTIVE CARD
+#  ACTIVE CARD — pure in-memory, no DB calls
 # ─────────────────────────────────────────────────────────
 
-def _render_active_card(db_session, mt: MeetingType, org_id: int) -> None:
-    instances = db_session.scalars(
-        select(MeetingInstance).where(
-            MeetingInstance.meeting_type_id == mt.id,
-            MeetingInstance.organization_id == org_id,
-        ).order_by(MeetingInstance.scheduled_date.desc())
-    ).all()
-
+def _render_active_card(
+    mt: MeetingType,
+    instances: list[MeetingInstance],
+    sessions_by_instance: dict[int, list[MeetingSession]],
+    actions_by_session: dict[int, list[Action]],
+) -> None:
     last_session_date = "—"
     open_actions = 0
     session_status_label = ""
 
+    # Most-recent instance first (already sorted desc from query)
     if instances:
         last_inst = instances[0]
-        sessions = db_session.scalars(
-            select(MeetingSession).where(MeetingSession.instance_id == last_inst.id)
-            .order_by(MeetingSession.created_at.desc())
-        ).all()
-        if sessions:
-            ls = sessions[0]
+        inst_sessions = sessions_by_instance.get(last_inst.id, [])
+        if inst_sessions:
+            ls = inst_sessions[0]  # already sorted desc
             d = _to_utc(ls.created_at)
             last_session_date = d.strftime("%d/%m/%Y") if d else "—"
             status_map = {
@@ -148,8 +177,9 @@ def _render_active_card(db_session, mt: MeetingType, org_id: int) -> None:
                 "closed": "✅ Clôturée",
             }
             session_status_label = status_map.get(ls.status, "")
+            actions = actions_by_session.get(ls.id, [])
             open_actions = sum(
-                1 for a in ls.actions if effective_status(a) in ("Open", "In Progress", "Late")
+                1 for a in actions if effective_status(a) in ("Open", "In Progress", "Late")
             )
 
     freq = FREQ_LABELS.get(mt.frequency, mt.frequency)
@@ -176,7 +206,7 @@ def _render_active_card(db_session, mt: MeetingType, org_id: int) -> None:
             st.caption("Aucune session")
 
         if st.button(
-            f"Ouvrir →",
+            "Ouvrir →",
             key=f"home_open_{mt.id}",
             use_container_width=True,
             type="primary",

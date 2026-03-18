@@ -18,6 +18,7 @@ from sqlalchemy import (
     UniqueConstraint,
     create_engine,
     select,
+    text,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, sessionmaker
 from werkzeug.security import check_password_hash, generate_password_hash
@@ -787,8 +788,26 @@ def _seed_demo_data(session, org: Organization, admin_user: "User") -> None:
         session.rollback()
 
 
+def _run_migrations() -> None:
+    """Safely add new columns to existing tables (idempotent — catches duplicate-column errors)."""
+    new_columns = [
+        ("meeting_instances", "custom_agenda_json", "TEXT"),
+        ("meeting_instances", "custom_duration_minutes", "INTEGER"),
+        ("meeting_sessions", "session_name", "VARCHAR(255)"),
+        ("meeting_sessions", "invited_emails_json", "TEXT"),
+    ]
+    with engine.connect() as conn:
+        for table, column, col_type in new_columns:
+            try:
+                conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {column} {col_type}"))
+                conn.commit()
+            except Exception:
+                conn.rollback()  # Column already exists — ignore
+
+
 def init_db() -> None:
     Base.metadata.create_all(bind=engine)
+    _run_migrations()
 
     with SessionLocal() as session:
         org = session.scalar(
