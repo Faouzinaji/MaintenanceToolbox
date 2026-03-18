@@ -56,12 +56,11 @@ def render_home(user, db_session) -> None:
         instances_by_type.setdefault(inst.meeting_type_id, []).append(inst)
 
     active_types = [mt for mt in all_types if mt.active]
-    inactive_types = [mt for mt in all_types if not mt.active]
 
     # ── Header ────────────────────────────────────────────────────────────────
     st.markdown(
         f"""<div style="margin-bottom:24px;">
-        <h1 style="color:#3f434f;margin-bottom:4px;">🏭 MaintenanceHub</h1>
+        <h1 style="color:#3f434f;margin-bottom:4px;">🔧 MaintenOps</h1>
         <div style="color:#888;font-size:1rem;">Pilotage des routines de maintenance · Bonjour, <strong>{user.full_name}</strong></div>
         </div>""",
         unsafe_allow_html=True,
@@ -80,9 +79,19 @@ def render_home(user, db_session) -> None:
         unsafe_allow_html=True,
     )
 
-    if active_types:
-        cols = st.columns(len(active_types))
-        for col, mt in zip(cols, active_types):
+    # Only show active meeting types that have at least one instance configured for this org
+    configured_types = [
+        mt for mt in active_types
+        if instances_by_type.get(mt.id)
+    ]
+    unconfigured_types = [
+        mt for mt in active_types
+        if not instances_by_type.get(mt.id)
+    ]
+
+    if configured_types:
+        cols = st.columns(min(len(configured_types), 4))
+        for col, mt in zip(cols, configured_types):
             with col:
                 _render_active_card(
                     mt,
@@ -90,25 +99,28 @@ def render_home(user, db_session) -> None:
                     sessions_by_instance,
                     actions_by_session,
                 )
-    else:
-        st.info("Aucun type de réunion actif configuré.")
+    elif not unconfigured_types:
+        st.info("Aucun type de réunion actif configuré. Un administrateur peut en créer depuis le menu Admin.")
 
-    st.divider()
-
-    # ── Inactive meetings ─────────────────────────────────────────────────────
-    st.markdown(
-        """<div style="display:flex;align-items:center;gap:12px;margin-bottom:16px;">
-        <div style="width:5px;height:28px;background:#aaa;border-radius:3px;"></div>
-        <h3 style="margin:0;color:#888;">En cours de déploiement</h3>
-        </div>""",
-        unsafe_allow_html=True,
-    )
-
-    if inactive_types:
-        cols = st.columns(min(len(inactive_types), 5))
-        for col, mt in zip(cols, inactive_types):
+    # Show unconfigured active types as locked placeholders (admin hint only)
+    if unconfigured_types and user.role == "admin":
+        st.divider()
+        st.caption("🔒 Réunions actives sans instance — à configurer dans l'Admin :")
+        cols = st.columns(min(len(unconfigured_types), 5))
+        for col, mt in zip(cols, unconfigured_types):
             with col:
-                _render_inactive_card(mt)
+                with st.container(border=True):
+                    st.markdown(
+                        f"""<div style="text-align:center;padding:8px 0;opacity:0.5;">
+                        <div style="font-size:1.6rem;">{mt.icon}</div>
+                        <div style="font-weight:600;color:#888;font-size:0.9rem;">{mt.name}</div>
+                        <div style="color:#aaa;font-size:0.75rem;">Aucune instance</div>
+                        </div>""",
+                        unsafe_allow_html=True,
+                    )
+                    if st.button("Configurer", key=f"cfg_{mt.id}", use_container_width=True):
+                        st.session_state["page"] = "admin"
+                        st.rerun()
 
 
 # ─────────────────────────────────────────────────────────

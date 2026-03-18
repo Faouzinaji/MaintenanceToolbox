@@ -362,6 +362,8 @@ class PlanningTask(Base):
     rex_done: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
     rex_cause_id: Mapped[Optional[int]] = mapped_column(ForeignKey("rex_causes.id"), nullable=True)
     rex_comment: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    rex_actual_start: Mapped[Optional[str]] = mapped_column(String(10), nullable=True)  # HH:MM
+    rex_actual_end: Mapped[Optional[str]] = mapped_column(String(10), nullable=True)    # HH:MM
 
     planning: Mapped[Planning] = relationship(back_populates="tasks")
     rex_cause: Mapped[Optional[RexCause]] = relationship()
@@ -795,6 +797,8 @@ def _run_migrations() -> None:
         ("meeting_instances", "custom_duration_minutes", "INTEGER"),
         ("meeting_sessions", "session_name", "VARCHAR(255)"),
         ("meeting_sessions", "invited_emails_json", "TEXT"),
+        ("planning_tasks", "rex_actual_start", "VARCHAR(10)"),
+        ("planning_tasks", "rex_actual_end", "VARCHAR(10)"),
     ]
     with engine.connect() as conn:
         for table, column, col_type in new_columns:

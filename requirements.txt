@@ -3,3 +3,5 @@ sqlalchemy
 psycopg2-binary
 werkzeug
 pandas
+matplotlib
+fpdf2

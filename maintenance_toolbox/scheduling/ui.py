@@ -987,6 +987,8 @@ def _render_rex_panel(session, user, planning_id):
                 "planned_start_at": str(t.planned_start_at) if t.planned_start_at else "",
                 "planned_team_name": t.planned_team_name or "",
                 "realise": bool(t.rex_done) if t.rex_done is not None else False,
+                "heure_debut": getattr(t, "rex_actual_start", "") or "",
+                "heure_fin": getattr(t, "rex_actual_end", "") or "",
                 "cause": current_label,
                 "commentaire": t.rex_comment or "",
                 "action": "",
@@ -1010,11 +1012,13 @@ def _render_rex_panel(session, user, planning_id):
             "planned_start_at": st.column_config.TextColumn("Début prévu", disabled=True),
             "planned_team_name": st.column_config.TextColumn("Equipe", disabled=True),
             "realise": st.column_config.CheckboxColumn("Réalisé"),
+            "heure_debut": st.column_config.TextColumn("Heure début réelle (HH:MM)"),
+            "heure_fin": st.column_config.TextColumn("Heure fin réelle (HH:MM)"),
             "cause": st.column_config.SelectboxColumn("Cause", options=cause_options),
             "commentaire": st.column_config.TextColumn("Commentaire"),
-            "action": st.column_config.TextColumn("Action"),
+            "action": st.column_config.TextColumn("Action corrective"),
             "responsable": st.column_config.TextColumn("Responsable"),
-            "delai": st.column_config.TextColumn("Délai"),
+            "delai": st.column_config.TextColumn("Délai (YYYY-MM-DD)"),
         },
     )
 
@@ -1031,8 +1035,23 @@ def _render_rex_panel(session, user, planning_id):
             key=f"rex_effective_end_{planning_id}",
         )
 
-    if st.button("Enregistrer le REX", key=f"save_rex_{planning_id}", use_container_width=True):
+    if st.button("Enregistrer le REX", key=f"save_rex_{planning_id}",
+                 use_container_width=True, type="primary"):
         try:
+            from maintenance_toolbox.db import Action
+            from datetime import datetime, timezone
+
+            # Get current meeting session id if called from within a meeting
+            hub_session_id = st.session_state.get("hub_session_id")
+            hub_mt_id = None
+            if hub_session_id:
+                from maintenance_toolbox.db import MeetingSession, MeetingInstance
+                ms_rec = session.get(MeetingSession, hub_session_id)
+                if ms_rec:
+                    inst = session.get(MeetingInstance, ms_rec.instance_id)
+                    if inst:
+                        hub_mt_id = inst.meeting_type_id
+
             for _, row in edited.iterrows():
                 ot_id = _safe_text(row["ot_id"])
                 task = next((x for x in selected_tasks if x.external_ot_id == ot_id), None)
@@ -1043,13 +1062,43 @@ def _render_rex_panel(session, user, planning_id):
                 label = _safe_text(row["cause"])
                 task.rex_cause_id = cause_map.get(label) if label else None
                 task.rex_comment = _safe_text(row["commentaire"])
+                task.rex_actual_start = _safe_text(row.get("heure_debut", "")) or None
+                task.rex_actual_end = _safe_text(row.get("heure_fin", "")) or None
+
+                # Save action to global Action table if filled
+                action_desc = _safe_text(row.get("action", ""))
+                resp = _safe_text(row.get("responsable", ""))
+                delai_str = _safe_text(row.get("delai", ""))
+                if action_desc and resp and hub_session_id:
+                    due_dt = None
+                    if delai_str:
+                        try:
+                            due_dt = datetime.strptime(delai_str[:10], "%Y-%m-%d").replace(tzinfo=timezone.utc)
+                        except ValueError:
+                            pass
+                    existing_action = session.scalar(
+                        select(Action).where(
+                            Action.meeting_session_id == hub_session_id,
+                            Action.description == action_desc,
+                        )
+                    )
+                    if not existing_action:
+                        session.add(Action(
+                            description=action_desc,
+                            owner=resp,
+                            due_date=due_dt,
+                            status="Open",
+                            meeting_session_id=hub_session_id,
+                            meeting_type_id=hub_mt_id,
+                            organization_id=planning.organization_id,
+                        ))
 
             session.commit()
             st.success("REX enregistré.")
 
             if effective_start or effective_end:
-                st.markdown(
-                    f"**Fenêtre réelle enregistrée pour démo** : démarrage = `{effective_start or '-'}` | fin = `{effective_end or '-'}`"
+                st.info(
+                    f"Fenêtre réelle : démarrage `{effective_start or '-'}` | fin `{effective_end or '-'}`"
                 )
 
             action_plan = edited[["ot_id", "action", "responsable", "delai"]].copy()
@@ -1060,12 +1109,144 @@ def _render_rex_panel(session, user, planning_id):
             ].copy()
 
             if not action_plan.empty:
-                st.markdown("#### Plan d'action généré")
+                st.markdown("#### Actions correctives enregistrées dans le plan d'action global")
                 st.dataframe(action_plan, use_container_width=True, hide_index=True)
 
         except Exception as e:
             session.rollback()
             st.error(f"Erreur lors de l'enregistrement du REX : {e}")
+
+
+# =========================================================
+# GANTT + PDF HELPERS
+# =========================================================
+
+def _render_gantt(generated_df: "pd.DataFrame", planning) -> None:
+    """Render a horizontal Gantt chart using matplotlib broken_barh."""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import matplotlib.dates as mdates
+
+        df = generated_df.copy()
+        df["_start"] = pd.to_datetime(df["planned_start_at"], errors="coerce")
+        df["_end"] = pd.to_datetime(df["planned_end_at"], errors="coerce")
+        df = df.dropna(subset=["_start", "_end"])
+
+        if df.empty:
+            st.info("Données insuffisantes pour le Gantt (pas de dates planifiées).")
+            return
+
+        ateliers = df["atelier"].unique().tolist()
+        cmap = plt.get_cmap("Set3")
+        colors = {a: cmap(i / max(len(ateliers), 1)) for i, a in enumerate(ateliers)}
+
+        fig_h = max(3.5, len(ateliers) * 0.9 + 2)
+        fig, ax = plt.subplots(figsize=(14, fig_h))
+
+        for i, atelier in enumerate(ateliers):
+            sub = df[df["atelier"] == atelier]
+            for _, row in sub.iterrows():
+                t0 = mdates.date2num(row["_start"].to_pydatetime())
+                t1 = mdates.date2num(row["_end"].to_pydatetime())
+                dur = max(t1 - t0, 1e-4)
+                ax.broken_barh(
+                    [(t0, dur)], (i - 0.38, 0.76),
+                    facecolors=colors[atelier], edgecolors="#ffffff", linewidth=0.8,
+                )
+                label = str(row.get("ot_id", ""))[:10]
+                ax.text(
+                    t0 + dur / 2, i, label,
+                    ha="center", va="center", fontsize=6.5, color="#2c2c2c", fontweight="bold",
+                )
+
+        ax.set_yticks(range(len(ateliers)))
+        ax.set_yticklabels(ateliers, fontsize=9)
+        ax.xaxis_date()
+        ax.xaxis.set_major_formatter(mdates.DateFormatter("%d/%m\n%H:%M"))
+        ax.xaxis.set_major_locator(mdates.AutoDateLocator())
+        ax.set_xlabel("Horaire", fontsize=9)
+        ax.set_title(f"Gantt — {planning.name}", fontsize=11, fontweight="bold")
+        ax.grid(True, axis="x", alpha=0.25, linestyle="--")
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        plt.tight_layout()
+        st.pyplot(fig, use_container_width=True)
+        plt.close(fig)
+
+    except ImportError:
+        st.info("matplotlib non disponible pour le Gantt.")
+    except Exception as e:
+        st.warning(f"Gantt non affiché : {e}")
+
+
+def _generate_planning_pdf(generated_df: "pd.DataFrame", planning) -> bytes:
+    """Generate a PDF summary of the planning using fpdf2."""
+    from fpdf import FPDF
+
+    pdf = FPDF(orientation="L", format="A4")
+    pdf.set_auto_page_break(auto=True, margin=12)
+    pdf.add_page()
+
+    # ── Header ──────────────────────────────────────────────────────────────
+    pdf.set_font("Helvetica", "B", 14)
+    pdf.cell(0, 10, f"Planning : {planning.name}", new_x="LMARGIN", new_y="NEXT")
+    pdf.set_font("Helvetica", "", 9)
+    pdf.cell(0, 6, f"Periode : {planning.start_at}  →  {planning.end_at}", new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(0, 6, f"Statut : {planning.status}", new_x="LMARGIN", new_y="NEXT")
+    pdf.ln(3)
+
+    # ── Summary metrics ─────────────────────────────────────────────────────
+    df = generated_df.copy()
+    n_ot = len(df)
+    total_h = round(float(df["duration_hours"].sum()) if "duration_hours" in df.columns else 0, 1)
+    ateliers = df["atelier"].unique().tolist() if "atelier" in df.columns else []
+
+    pdf.set_font("Helvetica", "B", 9)
+    pdf.cell(60, 7, f"OT planifiés : {n_ot}", border=1, align="C")
+    pdf.cell(60, 7, f"Charge totale : {total_h} h", border=1, align="C")
+    pdf.cell(80, 7, f"Ateliers : {', '.join(ateliers[:6])}", border=1, align="C")
+    pdf.ln(10)
+
+    # ── Table header ─────────────────────────────────────────────────────────
+    col_w = [22, 68, 28, 18, 38, 38, 34]
+    headers = ["N° OT", "Description", "Atelier", "Durée (h)", "Début", "Fin", "Equipe"]
+
+    pdf.set_fill_color(243, 146, 0)  # --mn-orange
+    pdf.set_text_color(255, 255, 255)
+    pdf.set_font("Helvetica", "B", 8)
+    for h, w in zip(headers, col_w):
+        pdf.cell(w, 8, h, border=1, align="C", fill=True)
+    pdf.ln()
+
+    # ── Table rows ────────────────────────────────────────────────────────────
+    pdf.set_text_color(0, 0, 0)
+    pdf.set_font("Helvetica", "", 7)
+    fill = False
+    for _, row in df.iterrows():
+        pdf.set_fill_color(255, 248, 235) if fill else pdf.set_fill_color(255, 255, 255)
+        cells = [
+            str(row.get("ot_id", ""))[:14],
+            str(row.get("description", ""))[:48],
+            str(row.get("atelier", ""))[:18],
+            str(round(float(row.get("duration_hours", 0) or 0), 1)),
+            str(row.get("planned_start_at", ""))[:16],
+            str(row.get("planned_end_at", ""))[:16],
+            str(row.get("planned_team_name", ""))[:18],
+        ]
+        for val, w in zip(cells, col_w):
+            pdf.cell(w, 6, val, border=1, fill=True)
+        pdf.ln()
+        fill = not fill
+
+    # ── Footer ────────────────────────────────────────────────────────────────
+    pdf.ln(4)
+    pdf.set_font("Helvetica", "I", 7)
+    pdf.set_text_color(150, 150, 150)
+    pdf.cell(0, 5, "Généré par MaintenOps", align="C")
+
+    return bytes(pdf.output())
 
 
 # =========================================================
@@ -1080,6 +1261,13 @@ def render_scheduling_module(session, user):
         return
 
     _init_wizard_state()
+
+    # FIX: resolve pending navigation BEFORE the widget renders.
+    # Directly setting st.session_state["scheduling_view"] after the radio widget
+    # has been instantiated raises StreamlitAPIException. Instead we set a shadow
+    # key "_sched_view_pending" and transfer it here, before the widget exists.
+    if "_sched_view_pending" in st.session_state:
+        st.session_state["scheduling_view"] = st.session_state.pop("_sched_view_pending")
 
     st.radio(
         "Navigation Scheduling",
@@ -1172,7 +1360,8 @@ def render_scheduling_module(session, user):
                     with c2:
                         if st.button("✏️", key=f"edit_{p.id}", use_container_width=True):
                             _load_planning_into_wizard(session, user, p)
-                            st.session_state["scheduling_view"] = "Créer un planning"
+                            # Use shadow key to avoid modifying widget-bound key after render
+                            st.session_state["_sched_view_pending"] = "Créer un planning"
                             st.rerun()
 
                     with c3:
@@ -1733,22 +1922,36 @@ def render_scheduling_module(session, user):
 
             if generated_df is not None and not generated_df.empty:
                 st.subheader("Planning généré")
+
+                display_cols = [c for c in [
+                    "ot_id", "description", "atelier",
+                    "duration_hours", "planned_start_at", "planned_end_at",
+                    "planned_team_name", "commentaire",
+                ] if c in generated_df.columns]
+
                 st.dataframe(
-                    generated_df[
-                        [
-                            "ot_id",
-                            "description",
-                            "atelier",
-                            "duration_hours",
-                            "planned_start_at",
-                            "planned_end_at",
-                            "planned_team_name",
-                            "commentaire",
-                        ]
-                    ],
+                    generated_df[display_cols],
                     use_container_width=True,
                     hide_index=True,
                 )
+
+                # ── Gantt chart ──────────────────────────────────────────────
+                st.subheader("Diagramme de Gantt")
+                _render_gantt(generated_df, planning)
+
+                # ── PDF download ─────────────────────────────────────────────
+                try:
+                    pdf_bytes = _generate_planning_pdf(generated_df, planning)
+                    st.download_button(
+                        label="📥 Télécharger le planning PDF",
+                        data=pdf_bytes,
+                        file_name=f"planning_{planning.name.replace(' ', '_')}.pdf",
+                        mime="application/pdf",
+                        type="primary",
+                        use_container_width=True,
+                    )
+                except Exception as pdf_err:
+                    st.caption(f"PDF non disponible : {pdf_err}")
 
             if manual_generated_df is not None and not manual_generated_df.empty:
                 st.subheader("Actions manuelles planifiées")

@@ -8,31 +8,56 @@ from maintenance_toolbox.meetings.hub import render_meeting_hub
 from maintenance_toolbox.settings_ui import render_settings
 
 
-st.set_page_config(page_title="MaintenanceHub", layout="wide")
+st.set_page_config(
+    page_title="MaintenOps",
+    page_icon="🔧",
+    layout="wide",
+)
 
+# ── Global CSS ───────────────────────────────────────────────────────────────
 st.markdown(
     """
     <style>
     :root {
         --mn-orange: #f39200;
-        --mn-dark: #3f434f;
-        --mn-light: #f7f7f7;
-        --mn-soft: #ead7b0;
+        --mn-dark:   #3f434f;
+        --mn-light:  #f7f7f7;
+        --mn-soft:   #ead7b0;
     }
 
     .stApp { background-color: white; }
 
     h1, h2, h3 { color: var(--mn-dark); }
 
+    /* ── Unified nav / tab button style ──────────────────────────────────── */
     .stButton > button {
-        border-radius: 10px;
+        border-radius: 8px;
         border: 1px solid #d9d9d9;
+        font-size: 0.9rem;
+        padding: 6px 12px;
     }
 
+    /* Primary = orange (active page or primary action) */
     .stButton > button[kind="primary"] {
         background-color: var(--mn-orange);
-        color: white;
+        color: white !important;
         border: 1px solid var(--mn-orange);
+        font-weight: 600;
+    }
+    .stButton > button[kind="primary"]:hover {
+        background-color: #e08700;
+        border-color: #e08700;
+    }
+
+    /* Secondary = ghost with dark border */
+    .stButton > button[kind="secondary"] {
+        background-color: white;
+        color: var(--mn-dark);
+        border: 1px solid #d9d9d9;
+    }
+    .stButton > button[kind="secondary"]:hover {
+        border-color: var(--mn-orange);
+        color: var(--mn-orange);
     }
 
     div[data-testid="stMetricValue"] { color: var(--mn-dark); }
@@ -42,19 +67,44 @@ st.markdown(
         font-weight: 600;
     }
 
-    /* Top nav active state */
-    .nav-active > button {
-        background: #fff3e0 !important;
-        border-color: var(--mn-orange) !important;
-        color: var(--mn-orange) !important;
-        font-weight: 700 !important;
+    /* ── Sticky timer banner ─────────────────────────────────────────────── */
+    .mn-timer-sticky {
+        position: sticky;
+        top: 0;
+        z-index: 990;
+        background: white;
+        padding: 6px 0 10px 0;
+        border-bottom: 2px solid #f0f0f0;
+        margin-bottom: 12px;
+    }
+
+    /* ── Red pulsing animation for timer in alert ────────────────────────── */
+    @keyframes mn-pulse {
+        0%   { box-shadow: 0 0 0 0 rgba(220,53,69,0.6); }
+        70%  { box-shadow: 0 0 0 12px rgba(220,53,69,0); }
+        100% { box-shadow: 0 0 0 0 rgba(220,53,69,0); }
+    }
+    .mn-timer-alert {
+        animation: mn-pulse 1.4s ease-in-out infinite;
+        border-radius: 8px;
+    }
+
+    /* ── Page-dim overlay during loading ────────────────────────────────── */
+    /* Triggered by adding .mn-loading class to body via JS — lightweight */
+    .mn-loading-overlay {
+        position: fixed;
+        inset: 0;
+        background: rgba(63,67,79,0.18);
+        z-index: 9999;
+        display: none;
     }
     </style>
     """,
     unsafe_allow_html=True,
 )
 
-with st.spinner("Initialisation…"):
+# ── DB init ──────────────────────────────────────────────────────────────────
+with st.spinner("Chargement…"):
     try:
         init_db()
     except Exception as e:
@@ -71,43 +121,35 @@ with SessionLocal() as session:
         render_login(session)
         st.stop()
 
-    # ── Top navigation ─────────────────────────────────────
+    # ── Top navigation ───────────────────────────────────────────────────────
     page = st.session_state["page"]
 
-    n_nav = 4 if user.role == "admin" else 3
-    nav_cols = st.columns([1.4] * n_nav + [8 - 1.4 * (n_nav - 3)])
-
-    col_idx = 0
-    with nav_cols[col_idx]:
-        col_idx += 1
-        if st.button("🏭 Cockpit", key="top_home", use_container_width=True,
-                     type="primary" if page == "home" else "secondary"):
-            st.session_state["page"] = "home"
-            st.rerun()
-
+    # Build nav items dynamically
+    nav_items = [("🏭 Cockpit", "home"), ("⚙️ Paramètres", "settings")]
     if user.role == "admin":
-        with nav_cols[col_idx]:
-            col_idx += 1
-            if st.button("🛠️ Admin", key="top_admin", use_container_width=True,
-                         type="primary" if page == "admin" else "secondary"):
-                st.session_state["page"] = "admin"
-                st.rerun()
+        nav_items.insert(1, ("🛠️ Admin", "admin"))
+    nav_items.append(("🚪 Déconnexion", "_logout"))
 
-    with nav_cols[col_idx]:
-        col_idx += 1
-        if st.button("⚙️ Paramètres", key="top_settings", use_container_width=True,
-                     type="primary" if page == "settings" else "secondary"):
-            st.session_state["page"] = "settings"
-            st.rerun()
+    # Narrow columns for nav buttons + spacer on the right
+    nav_widths = [1.5] * len(nav_items) + [max(1, 10 - 1.5 * len(nav_items))]
+    nav_cols = st.columns(nav_widths)
 
-    with nav_cols[col_idx]:
-        if st.button("🚪 Déconnexion", key="top_logout", use_container_width=True):
-            logout_user()
-            st.rerun()
+    for i, (label, target) in enumerate(nav_items):
+        with nav_cols[i]:
+            is_active = page == target
+            if target == "_logout":
+                if st.button(label, key="top_logout", use_container_width=True):
+                    logout_user()
+                    st.rerun()
+            else:
+                btn_type = "primary" if is_active else "secondary"
+                if st.button(label, key=f"top_{target}", use_container_width=True, type=btn_type):
+                    st.session_state["page"] = target
+                    st.rerun()
 
     st.divider()
 
-    # ── Page routing ────────────────────────────────────────
+    # ── Page routing ─────────────────────────────────────────────────────────
     if page == "home":
         render_home(user, session)
 

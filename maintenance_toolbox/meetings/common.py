@@ -94,34 +94,49 @@ def render_timer(session_record: MeetingSession, theoretical_min: int) -> None:
         st.info("⏱️ Session non démarrée — cliquez sur **Lancer la réunion** pour démarrer le chrono.")
         return
 
+    remaining = theoretical_min - elapsed
+    alert_mode = 0 < remaining <= 5 or elapsed > theoretical_min
+
     color = "#dc3545" if elapsed > theoretical_min else "#f39200"
     if elapsed <= theoretical_min * 0.8:
         color = "#28a745"
+    if alert_mode:
+        color = "#dc3545"
 
     over_txt = ""
     if over > 0:
         over_txt = f"&nbsp;⚠️ +{over} min"
 
-    c1, c2, c3 = st.columns([2, 2, 4])
-    with c1:
-        st.metric("⏱️ Temps écoulé", f"{elapsed} min")
-    with c2:
-        st.metric("🎯 Durée théorique", f"{theoretical_min} min")
-    with c3:
-        bar_pct = min(pct, 100)
-        bar_color = color
-        st.markdown(
-            f"""<div style="margin-top:8px;">
-            <div style="background:#e9e9e9;border-radius:6px;height:18px;width:100%;">
-              <div style="background:{bar_color};width:{bar_pct:.0f}%;height:18px;
-                border-radius:6px;transition:width 0.3s;"></div>
+    pulse_class = "mn-timer-alert" if alert_mode else ""
+    alert_bg = "#fff5f5" if alert_mode else "white"
+    border_color = "#dc3545" if alert_mode else "#f0f0f0"
+
+    bar_pct = min(pct, 100)
+
+    st.markdown(
+        f"""<div class="mn-timer-sticky {pulse_class}"
+            style="background:{alert_bg};border:2px solid {border_color};
+                   border-radius:10px;padding:10px 16px;">
+          <div style="display:flex;align-items:center;gap:24px;flex-wrap:wrap;">
+            <div>
+              <div style="font-size:0.75rem;color:#888;">⏱️ Temps écoulé</div>
+              <div style="font-size:1.4rem;font-weight:700;color:{color};">{elapsed} min</div>
             </div>
-            <small style="color:{bar_color};">{pct:.0f}% de la durée théorique{over_txt}</small>
-            </div>""",
-            unsafe_allow_html=True,
-        )
-    if st.button("🔄 Rafraîchir le chrono", key="timer_refresh"):
-        st.rerun()
+            <div>
+              <div style="font-size:0.75rem;color:#888;">🎯 Durée théorique</div>
+              <div style="font-size:1.4rem;font-weight:700;color:#3f434f;">{theoretical_min} min</div>
+            </div>
+            <div style="flex:1;min-width:180px;">
+              <div style="background:#e9e9e9;border-radius:6px;height:16px;width:100%;margin-top:4px;">
+                <div style="background:{color};width:{bar_pct:.0f}%;height:16px;
+                     border-radius:6px;transition:width 0.5s;"></div>
+              </div>
+              <small style="color:{color};">{pct:.0f}% de la durée théorique{over_txt}</small>
+            </div>
+          </div>
+        </div>""",
+        unsafe_allow_html=True,
+    )
 
 
 # ─────────────────────────────────────────────────────────
@@ -394,6 +409,6 @@ def _generate_mail(summary, instance, meeting_type, attendees, actions) -> tuple
         f"({instance.name}).\n\n"
         f"--- RÉSUMÉ ---\n{summary}\n"
         f"{action_lines}\n\n"
-        f"Cordialement,\nL'équipe MaintenanceHub"
+        f"Cordialement,\nL'équipe MaintenOps"
     )
     return subject, recipients, body
