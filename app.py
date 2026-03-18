@@ -54,11 +54,12 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-try:
-    init_db()
-except Exception as e:
-    st.error(f"Erreur base de données : {e}")
-    st.stop()
+with st.spinner("Initialisation…"):
+    try:
+        init_db()
+    except Exception as e:
+        st.error(f"Erreur base de données : {e}")
+        st.stop()
 
 if "page" not in st.session_state:
     st.session_state["page"] = "home"
@@ -73,34 +74,33 @@ with SessionLocal() as session:
     # ── Top navigation ─────────────────────────────────────
     page = st.session_state["page"]
 
-    nav_cols = st.columns([1.4, 1.2, 1.2, 1.2, 1.2, 8])
+    n_nav = 4 if user.role == "admin" else 3
+    nav_cols = st.columns([1.4] * n_nav + [8 - 1.4 * (n_nav - 3)])
 
-    with nav_cols[0]:
-        active_cls = "nav-active" if page == "home" else ""
-        st.markdown(f'<div class="{active_cls}">', unsafe_allow_html=True)
-        if st.button("🏭 Cockpit", key="top_home", use_container_width=True):
+    col_idx = 0
+    with nav_cols[col_idx]:
+        col_idx += 1
+        if st.button("🏭 Cockpit", key="top_home", use_container_width=True,
+                     type="primary" if page == "home" else "secondary"):
             st.session_state["page"] = "home"
             st.rerun()
-        st.markdown("</div>", unsafe_allow_html=True)
 
-    with nav_cols[1]:
-        if user.role == "admin":
-            active_cls = "nav-active" if page == "admin" else ""
-            st.markdown(f'<div class="{active_cls}">', unsafe_allow_html=True)
-            if st.button("🛠️ Admin", key="top_admin", use_container_width=True):
+    if user.role == "admin":
+        with nav_cols[col_idx]:
+            col_idx += 1
+            if st.button("🛠️ Admin", key="top_admin", use_container_width=True,
+                         type="primary" if page == "admin" else "secondary"):
                 st.session_state["page"] = "admin"
                 st.rerun()
-            st.markdown("</div>", unsafe_allow_html=True)
 
-    with nav_cols[2]:
-        active_cls = "nav-active" if page == "settings" else ""
-        st.markdown(f'<div class="{active_cls}">', unsafe_allow_html=True)
-        if st.button("⚙️ Paramètres", key="top_settings", use_container_width=True):
+    with nav_cols[col_idx]:
+        col_idx += 1
+        if st.button("⚙️ Paramètres", key="top_settings", use_container_width=True,
+                     type="primary" if page == "settings" else "secondary"):
             st.session_state["page"] = "settings"
             st.rerun()
-        st.markdown("</div>", unsafe_allow_html=True)
 
-    with nav_cols[3]:
+    with nav_cols[col_idx]:
         if st.button("🚪 Déconnexion", key="top_logout", use_container_width=True):
             logout_user()
             st.rerun()

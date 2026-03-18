@@ -389,14 +389,22 @@ class MeetingType(Base):
 
 
 class MeetingInstance(Base):
+    """A meeting configured by admin from a MeetingType template.
+    Called 'réunion' in the UI (e.g. 'Pré-scheduling Ligne A').
+    """
     __tablename__ = "meeting_instances"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     meeting_type_id: Mapped[int] = mapped_column(ForeignKey("meeting_types.id"), index=True)
     organization_id: Mapped[int] = mapped_column(ForeignKey("organizations.id"), index=True)
     name: Mapped[str] = mapped_column(String(255))
-    scheduled_date: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Custom agenda overrides the MeetingType default agenda when set
+    custom_agenda_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    # Custom duration overrides the MeetingType default duration when set
+    custom_duration_minutes: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    # Legacy field kept for backward compat; new duplicates store emails in MeetingSession
     participants_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    scheduled_date: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     created_by_user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
@@ -408,12 +416,35 @@ class MeetingInstance(Base):
         back_populates="instance", cascade="all, delete-orphan"
     )
 
+    def effective_agenda(self) -> list[str]:
+        src = self.custom_agenda_json or (self.meeting_type.agenda_json if self.meeting_type else None)
+        if src:
+            try:
+                return json.loads(src)
+            except Exception:
+                pass
+        return []
+
+    def effective_duration(self) -> int:
+        if self.custom_duration_minutes is not None:
+            return self.custom_duration_minutes
+        if self.meeting_type:
+            return self.meeting_type.duration_minutes
+        return 60
+
 
 class MeetingSession(Base):
+    """A duplicate/run of a MeetingInstance. Called 'duplicate' in the UI.
+    Stores its own participant list (emails) set by admin at creation time.
+    """
     __tablename__ = "meeting_sessions"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     instance_id: Mapped[int] = mapped_column(ForeignKey("meeting_instances.id"), index=True)
+    # Name of this duplicate (e.g. "Semaine 12 — Ligne A")
+    session_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    # Participant emails set by admin when creating the duplicate
+    invited_emails_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     started_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     ended_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     duration_real_minutes: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
@@ -432,6 +463,21 @@ class MeetingSession(Base):
     actions: Mapped[list["Action"]] = relationship(
         back_populates="session", cascade="all, delete-orphan"
     )
+
+    def get_invited(self) -> list[str]:
+        """Return participant list from invited_emails_json or legacy participants_json."""
+        if self.invited_emails_json:
+            try:
+                return json.loads(self.invited_emails_json)
+            except Exception:
+                pass
+        # Fallback to instance-level participants
+        if self.instance and self.instance.participants_json:
+            try:
+                return json.loads(self.instance.participants_json)
+            except Exception:
+                pass
+        return []
 
 
 class Action(Base):
@@ -552,84 +598,172 @@ def _init_meeting_types(session) -> None:
 
 def _seed_demo_data(session, org: Organization, admin_user: "User") -> None:
     """Seed realistic demo data for KPI pages. Runs only if no instances exist for the org."""
-    existing = session.scalar(
-        select(MeetingInstance).where(MeetingInstance.organization_id == org.id)
-    )
-    if existing:
-        return
-
-    rng = random.Random(42)
-    now = datetime.now(timezone.utc)
-
-    PARTICIPANTS = [
-        "Pierre Dupont", "Marie Lambert", "Thomas Bernard",
-        "Isabelle Fontaine", "Laurent Morel", "Christine Petit",
-        "Nicolas Roux", "Sophie Martin",
-    ]
-
-    ACTION_TEMPLATES = [
-        ("Commander les pièces pour OT-{n}", "Pierre Dupont"),
-        ("Valider le planning avec la production", "Marie Lambert"),
-        ("Mettre à jour la GMAO suite au REX", "Thomas Bernard"),
-        ("Former l'équipe sur la nouvelle procédure", "Isabelle Fontaine"),
-        ("Clôturer les OT en attente depuis >30j", "Laurent Morel"),
-        ("Réviser le plan préventif du trimestre", "Christine Petit"),
-        ("Audit sécurité zone convoyeur", "Nicolas Roux"),
-        ("Rapport mensuel maintenance", "Sophie Martin"),
-        ("Relance fournisseur pièce critique", "Pierre Dupont"),
-        ("Réunion alignement planning/production", "Marie Lambert"),
-        ("Vérifier alignement pompe secteur 4", "Thomas Bernard"),
-        ("Mettre à jour le plan de lubrification", "Isabelle Fontaine"),
-    ]
-
-    def _pick_attendees():
-        n = rng.randint(5, 8)
-        present = rng.sample(PARTICIPANTS, n)
-        absent = [p for p in PARTICIPANTS if p not in present]
-        return present, absent
-
-    def _action_status(weeks_ago: int) -> str:
-        if weeks_ago >= 4:
-            return rng.choice(["Done", "Done", "Done", "Late"])
-        if weeks_ago >= 2:
-            return rng.choice(["Done", "In Progress", "Open", "Late"])
-        return rng.choice(["Open", "Open", "In Progress"])
-
-    def _make_session(instance: MeetingInstance, weeks_ago: int, theoretical_min: int) -> None:
-        sched_date = now - timedelta(weeks=weeks_ago)
-        # 80% of past sessions are closed
-        if weeks_ago == 0:
-            status = "draft"
-            started = None
-            ended = None
-            real_min = None
-        else:
-            status = "closed" if rng.random() < 0.85 else "closed"
-            variance = rng.randint(-20, 30)
-            real_min = theoretical_min + variance
-            started = sched_date.replace(hour=9, minute=0, second=0, microsecond=0)
-            ended = started + timedelta(minutes=real_min)
-
-        present, absent = _pick_attendees()
-
-        ms = MeetingSession(
-            instance_id=instance.id,
-            started_at=started,
-            ended_at=ended,
-            duration_real_minutes=real_min,
-            attendees_json=json.dumps(present),
-            absents_json=json.dumps(absent),
-            status=status,
-            summary=(
-                f"Réunion {instance.name} — {len(present)} présents. "
-                f"Durée réelle : {real_min} min." if real_min else "Session non démarrée."
-            ),
+    try:
+        existing = session.scalar(
+            select(MeetingInstance).where(MeetingInstance.organization_id == org.id)
         )
-        session.add(ms)
+        if existing:
+            return
+
+        rng = random.Random(42)
+        now = datetime.now(timezone.utc)
+
+        PARTICIPANTS = [
+            "Pierre Dupont", "Marie Lambert", "Thomas Bernard",
+            "Isabelle Fontaine", "Laurent Morel", "Christine Petit",
+            "Nicolas Roux", "Sophie Martin",
+        ]
+
+        ACTION_TEMPLATES = [
+            ("Commander les pièces pour OT-{n}", "Pierre Dupont"),
+            ("Valider le planning avec la production", "Marie Lambert"),
+            ("Mettre à jour la GMAO suite au REX", "Thomas Bernard"),
+            ("Former l'équipe sur la nouvelle procédure", "Isabelle Fontaine"),
+            ("Clôturer les OT en attente depuis >30j", "Laurent Morel"),
+            ("Réviser le plan préventif du trimestre", "Christine Petit"),
+            ("Audit sécurité zone convoyeur", "Nicolas Roux"),
+            ("Rapport mensuel maintenance", "Sophie Martin"),
+            ("Relance fournisseur pièce critique", "Pierre Dupont"),
+            ("Réunion alignement planning/production", "Marie Lambert"),
+            ("Vérifier alignement pompe secteur 4", "Thomas Bernard"),
+            ("Mettre à jour le plan de lubrification", "Isabelle Fontaine"),
+        ]
+
+        def _pick_attendees():
+            n = rng.randint(5, 8)
+            present = rng.sample(PARTICIPANTS, n)
+            absent = [p for p in PARTICIPANTS if p not in present]
+            return present, absent
+
+        def _action_status(weeks_ago: int) -> str:
+            if weeks_ago >= 4:
+                return rng.choice(["Done", "Done", "Done", "Late"])
+            if weeks_ago >= 2:
+                return rng.choice(["Done", "In Progress", "Open", "Late"])
+            return rng.choice(["Open", "Open", "In Progress"])
+
+        mt_map = {
+            mt.module_key: mt
+            for mt in session.scalars(select(MeetingType)).all()
+            if mt.module_key
+        }
+
+        # ── Phase 1: create all instances (no flush per instance) ──────────────
+        # Store (instance, weeks_ago, theoretical_min) for phase 2
+        instance_specs: list[tuple] = []
+
+        mt = mt_map.get("pre_scheduling")
+        if mt:
+            for i in range(6, -1, -1):
+                sched = now - timedelta(weeks=i)
+                week_num = sched.isocalendar()[1]
+                inst = MeetingInstance(
+                    meeting_type_id=mt.id,
+                    organization_id=org.id,
+                    name=f"Pré-scheduling S{week_num}",
+                    scheduled_date=sched,
+                    participants_json=json.dumps(PARTICIPANTS),
+                    created_by_user_id=admin_user.id,
+                    created_at=sched - timedelta(days=1),
+                )
+                session.add(inst)
+                instance_specs.append((inst, i, mt.duration_minutes))
+
+        mt = mt_map.get("scheduling")
+        if mt:
+            for i in range(6, -1, -1):
+                sched = now - timedelta(weeks=i)
+                week_num = sched.isocalendar()[1]
+                inst = MeetingInstance(
+                    meeting_type_id=mt.id,
+                    organization_id=org.id,
+                    name=f"Scheduling S{week_num}",
+                    scheduled_date=sched,
+                    participants_json=json.dumps(PARTICIPANTS),
+                    created_by_user_id=admin_user.id,
+                    created_at=sched - timedelta(days=1),
+                )
+                session.add(inst)
+                instance_specs.append((inst, i, mt.duration_minutes))
+
+        mt = mt_map.get("comite")
+        if mt:
+            for i in range(3, -1, -1):
+                sched = now - timedelta(weeks=i * 4)
+                month_name = sched.strftime("%B %Y")
+                inst = MeetingInstance(
+                    meeting_type_id=mt.id,
+                    organization_id=org.id,
+                    name=f"Comité maintenance {month_name}",
+                    scheduled_date=sched,
+                    participants_json=json.dumps(PARTICIPANTS),
+                    created_by_user_id=admin_user.id,
+                    created_at=sched - timedelta(days=2),
+                )
+                session.add(inst)
+                instance_specs.append((inst, i * 4, mt.duration_minutes))
+
+        mt = mt_map.get("codir")
+        if mt:
+            for i in range(2, -1, -1):
+                sched = now - timedelta(weeks=i * 4)
+                month_name = sched.strftime("%B %Y")
+                inst = MeetingInstance(
+                    meeting_type_id=mt.id,
+                    organization_id=org.id,
+                    name=f"Codir {month_name}",
+                    scheduled_date=sched,
+                    participants_json=json.dumps(PARTICIPANTS),
+                    created_by_user_id=admin_user.id,
+                    created_at=sched - timedelta(days=3),
+                )
+                session.add(inst)
+                instance_specs.append((inst, i * 4, mt.duration_minutes))
+
+        # Single flush → all instance.id are now populated
         session.flush()
 
-        # Create 2-4 actions per closed session
-        if status == "closed":
+        # ── Phase 2: create all sessions (no flush per session) ────────────────
+        # Store (session, weeks_ago, meeting_type_id, org_id) for phase 3
+        session_specs: list[tuple] = []
+
+        for inst, weeks_ago, theoretical_min in instance_specs:
+            sched_date = now - timedelta(weeks=weeks_ago)
+            if weeks_ago == 0:
+                status = "draft"
+                started = ended = real_min = None
+            else:
+                status = "closed"
+                variance = rng.randint(-20, 30)
+                real_min = theoretical_min + variance
+                started = sched_date.replace(hour=9, minute=0, second=0, microsecond=0)
+                ended = started + timedelta(minutes=real_min)
+
+            present, absent = _pick_attendees()
+            ms = MeetingSession(
+                instance_id=inst.id,
+                started_at=started,
+                ended_at=ended,
+                duration_real_minutes=real_min,
+                attendees_json=json.dumps(present),
+                absents_json=json.dumps(absent),
+                status=status,
+                summary=(
+                    f"Réunion {inst.name} — {len(present)} présents. "
+                    f"Durée réelle : {real_min} min." if real_min else "Session non démarrée."
+                ),
+            )
+            session.add(ms)
+            session_specs.append((ms, weeks_ago, inst.meeting_type_id, org.id))
+
+        # Single flush → all ms.id are now populated
+        session.flush()
+
+        # ── Phase 3: create all actions ────────────────────────────────────────
+        for ms, weeks_ago, meeting_type_id, organization_id in session_specs:
+            if ms.status != "closed":
+                continue
+            sched_date = now - timedelta(weeks=weeks_ago)
             n_actions = rng.randint(2, 4)
             for _ in range(n_actions):
                 tpl = rng.choice(ACTION_TEMPLATES)
@@ -643,94 +777,14 @@ def _seed_demo_data(session, org: Organization, admin_user: "User") -> None:
                     due_date=due,
                     status=a_status,
                     meeting_session_id=ms.id,
-                    meeting_type_id=instance.meeting_type_id,
-                    organization_id=org.id,
+                    meeting_type_id=meeting_type_id,
+                    organization_id=organization_id,
                 ))
 
-    # Get meeting types
-    mt_map = {
-        mt.module_key: mt
-        for mt in session.scalars(select(MeetingType)).all()
-        if mt.module_key
-    }
+        session.commit()
 
-    # Pre-scheduling: 6 weekly instances
-    mt = mt_map.get("pre_scheduling")
-    if mt:
-        for i in range(6, -1, -1):
-            sched = now - timedelta(weeks=i)
-            week_num = sched.isocalendar()[1]
-            inst = MeetingInstance(
-                meeting_type_id=mt.id,
-                organization_id=org.id,
-                name=f"Pré-scheduling S{week_num}",
-                scheduled_date=sched,
-                participants_json=json.dumps(PARTICIPANTS),
-                created_by_user_id=admin_user.id,
-                created_at=sched - timedelta(days=1),
-            )
-            session.add(inst)
-            session.flush()
-            _make_session(inst, i, mt.duration_minutes)
-
-    # Scheduling: 6 weekly instances
-    mt = mt_map.get("scheduling")
-    if mt:
-        for i in range(6, -1, -1):
-            sched = now - timedelta(weeks=i)
-            week_num = sched.isocalendar()[1]
-            inst = MeetingInstance(
-                meeting_type_id=mt.id,
-                organization_id=org.id,
-                name=f"Scheduling S{week_num}",
-                scheduled_date=sched,
-                participants_json=json.dumps(PARTICIPANTS),
-                created_by_user_id=admin_user.id,
-                created_at=sched - timedelta(days=1),
-            )
-            session.add(inst)
-            session.flush()
-            _make_session(inst, i, mt.duration_minutes)
-
-    # Comité: 3 monthly instances
-    mt = mt_map.get("comite")
-    if mt:
-        for i in range(3, -1, -1):
-            sched = now - timedelta(weeks=i * 4)
-            month_name = sched.strftime("%B %Y")
-            inst = MeetingInstance(
-                meeting_type_id=mt.id,
-                organization_id=org.id,
-                name=f"Comité maintenance {month_name}",
-                scheduled_date=sched,
-                participants_json=json.dumps(PARTICIPANTS),
-                created_by_user_id=admin_user.id,
-                created_at=sched - timedelta(days=2),
-            )
-            session.add(inst)
-            session.flush()
-            _make_session(inst, i * 4, mt.duration_minutes)
-
-    # Codir: 2 monthly instances
-    mt = mt_map.get("codir")
-    if mt:
-        for i in range(2, -1, -1):
-            sched = now - timedelta(weeks=i * 4)
-            month_name = sched.strftime("%B %Y")
-            inst = MeetingInstance(
-                meeting_type_id=mt.id,
-                organization_id=org.id,
-                name=f"Codir {month_name}",
-                scheduled_date=sched,
-                participants_json=json.dumps(PARTICIPANTS),
-                created_by_user_id=admin_user.id,
-                created_at=sched - timedelta(days=3),
-            )
-            session.add(inst)
-            session.flush()
-            _make_session(inst, i * 4, mt.duration_minutes)
-
-    session.commit()
+    except Exception:
+        session.rollback()
 
 
 def init_db() -> None:

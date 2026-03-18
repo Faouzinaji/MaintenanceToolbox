@@ -130,7 +130,9 @@ def _normalize_ts(ts):
         return None
     ts = pd.Timestamp(ts)
     if ts.tzinfo is not None:
-        return ts.tz_localize(None)
+        # BUG FIX: tz_localize(None) raises TypeError in pandas 2.x on tz-aware timestamps.
+        # Use tz_convert(None) to strip timezone without crashing.
+        return ts.tz_convert(None)
     return ts
 
 
@@ -309,6 +311,72 @@ def _delete_planning(session, planning_id):
     if planning:
         session.delete(planning)
         session.commit()
+
+
+def _load_planning_into_wizard(session, user, planning):
+    """Restore wizard state from a saved planning for editing.
+    BUG FIX: This function was missing, causing NameError on the edit button.
+    """
+    _reset_wizard()
+    st.session_state["wizard_planning_id"] = planning.id
+
+    mapping = _load_saved_mapping(session, user.organization_id)
+    st.session_state["wizard_mapping"] = mapping
+
+    # Restore CSV + tasks if available
+    if planning.csv_bytes and mapping:
+        try:
+            df = _read_csv_safely(planning.csv_bytes)
+            tasks_df = _build_tasks_df_from_mapping(df, mapping)
+
+            # Restore per-atelier selections from DB
+            db_selected = {t.external_ot_id for t in planning.tasks if t.selected}
+            if db_selected:
+                tasks_df["selected"] = tasks_df["ot_id"].astype(str).isin(db_selected)
+                for t in planning.tasks:
+                    if t.selected:
+                        mask = tasks_df["ot_id"].astype(str) == str(t.external_ot_id)
+                        if t.planned_start_at:
+                            tasks_df.loc[mask, "planned_start_at"] = str(t.planned_start_at)
+                        if t.planned_end_at:
+                            tasks_df.loc[mask, "planned_end_at"] = str(t.planned_end_at)
+                        if t.planned_team_name:
+                            tasks_df.loc[mask, "planned_team_name"] = t.planned_team_name
+
+            st.session_state["wizard_tasks_df"] = tasks_df
+
+            # Restore ateliers / secteurs from DB tasks
+            ateliers = sorted({t.atelier for t in planning.tasks if t.atelier})
+            secteurs = sorted({t.secteur for t in planning.tasks if t.secteur and t.secteur != "None"})
+            st.session_state["wizard_selected_ateliers"] = ateliers
+            st.session_state["wizard_selected_secteurs"] = secteurs
+            st.session_state["wizard_filtered_tasks_df"] = _build_filtered_tasks_df(tasks_df, ateliers, secteurs)
+
+            # Restore teams from DB
+            if planning.teams:
+                team_rows = []
+                for team in planning.teams:
+                    team_rows.append({
+                        "atelier": team.atelier,
+                        "code": team.code,
+                        "name": team.name,
+                        "available_from": _normalize_ts(team.available_from).strftime("%Y-%m-%d %H:%M") if team.available_from else "",
+                        "available_to": _normalize_ts(team.available_to).strftime("%Y-%m-%d %H:%M") if team.available_to else "",
+                    })
+                st.session_state["wizard_teams_df"] = pd.DataFrame(team_rows)
+
+            # Restore selected df
+            selected_tasks = [t for t in planning.tasks if t.selected]
+            if selected_tasks and not tasks_df.empty:
+                selected_ids = {t.external_ot_id for t in selected_tasks}
+                sel_df = tasks_df[tasks_df["ot_id"].astype(str).isin(selected_ids)].copy()
+                st.session_state["wizard_selected_df"] = sel_df
+
+            st.session_state["wizard_active_section"] = 6 if planning.status == "generated" else 2
+        except Exception:
+            st.session_state["wizard_active_section"] = 1
+    else:
+        st.session_state["wizard_active_section"] = 1
 
 
 # =========================================================
@@ -1114,13 +1182,21 @@ def render_scheduling_module(session, user):
                             st.rerun()
 
                     with c4:
-                        if st.button("📝", key=f"rex_{p.id}", use_container_width=True):
-                            st.session_state["rex_planning_id"] = p.id
+                        # BUG FIX: REX button now toggles instead of always rerunning,
+                        # so the panel stays visible without requiring scroll.
+                        rex_active = st.session_state.get("rex_planning_id") == p.id
+                        label = "✅ REX actif" if rex_active else "📝 REX"
+                        if st.button(label, key=f"rex_{p.id}", use_container_width=True):
+                            if rex_active:
+                                st.session_state["rex_planning_id"] = None
+                            else:
+                                st.session_state["rex_planning_id"] = p.id
                             st.rerun()
 
                     st.divider()
 
             if st.session_state.get("rex_planning_id"):
+                st.markdown('<div id="rex-anchor"></div>', unsafe_allow_html=True)
                 _render_rex_panel(session, user, st.session_state["rex_planning_id"])
 
         except Exception as e:
