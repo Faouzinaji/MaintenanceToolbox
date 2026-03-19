@@ -24,7 +24,7 @@ def logout_user():
 
 
 def render_login(session):
-    st.title("MaintenanceToolbox")
+    st.title("🔧 MaintenOps")
     st.subheader("Connexion")
 
     with st.form("login_form"):
