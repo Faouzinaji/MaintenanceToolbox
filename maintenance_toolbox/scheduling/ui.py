@@ -376,7 +376,7 @@ def _build_filtered_tasks_df(tasks_df, selected_ateliers, selected_secteurs):
     if selected_secteurs:
         df = df[df["secteur"].isin(selected_secteurs)]
 
-    return df.copy()
+    return df
 
 
 def _initialize_team_roster(atelier, n_teams, start_dt, end_dt):
@@ -815,6 +815,7 @@ def _persist_generation(session, planning, all_tasks_df, teams_df):
 # DASHBOARD DEMO
 # =========================================================
 
+@st.cache_data(show_spinner=False)
 def _build_demo_dashboard_data():
     random.seed(42)
     weeks = [f"2025-W{str(i).zfill(2)}" for i in range(48, 53)] + [f"2026-W{str(i).zfill(2)}" for i in range(1, 9)]
@@ -836,6 +837,7 @@ def _build_demo_dashboard_data():
     return pd.DataFrame(rows)
 
 
+@st.cache_data(show_spinner=False)
 def _build_demo_causes_df(weeks):
     random.seed(7)
     rows = []
@@ -1202,7 +1204,6 @@ def render_scheduling_module(session, user):
                     st.session_state["wizard_planning_id"] = planning.id
 
                 st.session_state["wizard_active_section"] = 2
-                st.rerun()
 
             except Exception as e:
                 session.rollback()
@@ -1240,8 +1241,9 @@ def render_scheduling_module(session, user):
 
         if local_df is not None:
             columns = list(local_df.columns)
-            saved_mapping = _load_saved_mapping(session, user.organization_id)
-            current_mapping = st.session_state.get("wizard_mapping", {}) or saved_mapping
+            current_mapping = st.session_state.get("wizard_mapping") or {}
+            if not current_mapping:
+                current_mapping = _load_saved_mapping(session, user.organization_id)
 
             targets = [
                 ("ot_id", "OT"),
@@ -1277,7 +1279,6 @@ def render_scheduling_module(session, user):
                     _save_mapping(session, user.organization_id, mapping)
                     st.session_state["wizard_tasks_df"] = _build_tasks_df_from_mapping(local_df, mapping)
                     st.session_state["wizard_active_section"] = 3
-                    st.rerun()
 
     with st.expander("3. Sélection ateliers / secteurs", expanded=st.session_state["wizard_active_section"] == 3):
         tasks_df = st.session_state.get("wizard_tasks_df")
@@ -1307,7 +1308,6 @@ def render_scheduling_module(session, user):
                 st.session_state["wizard_selected_secteurs"] = selected_secteurs
                 st.session_state["wizard_filtered_tasks_df"] = _build_filtered_tasks_df(tasks_df, selected_ateliers, selected_secteurs)
                 st.session_state["wizard_active_section"] = 4
-                st.rerun()
 
     with st.expander("4. Teams", expanded=st.session_state["wizard_active_section"] == 4):
         filtered_df = st.session_state.get("wizard_filtered_tasks_df")
@@ -1374,7 +1374,6 @@ def render_scheduling_module(session, user):
                 )
                 st.session_state["wizard_current_atelier_idx"] = 0
                 st.session_state["wizard_active_section"] = 5
-                st.rerun()
 
     with st.expander("5. Sélection des OT par atelier", expanded=st.session_state["wizard_active_section"] == 5):
         filtered_df = st.session_state.get("wizard_filtered_tasks_df")
@@ -1552,7 +1551,6 @@ def render_scheduling_module(session, user):
 
                 st.session_state["wizard_selected_df"] = pd.concat(final_frames, ignore_index=True) if final_frames else pd.DataFrame()
                 st.session_state["wizard_active_section"] = 6
-                st.rerun()
 
     with st.expander("6. Génération du planning", expanded=st.session_state["wizard_active_section"] == 6):
         selected_df = st.session_state.get("wizard_selected_df")
@@ -1645,7 +1643,6 @@ def render_scheduling_module(session, user):
                     st.session_state["wizard_tasks_df"] = all_tasks_df.copy()
 
                     st.success("Planning généré et enregistré.")
-                    st.rerun()
 
                 except Exception as e:
                     session.rollback()

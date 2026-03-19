@@ -82,17 +82,14 @@ with SessionLocal() as session:
     with c1:
         if st.button("🏠 Accueil", key="top_home", use_container_width=True):
             st.session_state["page"] = "home"
-            st.rerun()
 
     with c2:
         if st.button("📅 Scheduling", key="top_scheduling", use_container_width=True):
             st.session_state["page"] = "scheduling"
-            st.rerun()
 
     with c3:
         if st.button("⚙️ Settings", key="top_settings", use_container_width=True):
             st.session_state["page"] = "settings"
-            st.rerun()
 
     with c4:
         if st.button("🚪 Logout", key="top_logout", use_container_width=True):

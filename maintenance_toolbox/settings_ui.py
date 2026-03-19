@@ -20,7 +20,6 @@ def render_settings(session, user):
                 user.language = language
                 session.commit()
                 st.success("Langue mise à jour.")
-                st.rerun()
             except Exception as e:
                 session.rollback()
                 st.error(f"Erreur lors de la mise à jour de la langue : {e}")
