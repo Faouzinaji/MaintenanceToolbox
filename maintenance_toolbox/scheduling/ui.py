@@ -218,6 +218,8 @@ def _init_wizard_state():
         "wizard_planning_id": None,
         "wizard_active_section": 1,
         "wizard_mapping": {},
+        "wizard_csv_bytes": None,       # CSV bytes before planning exists (step 1 first)
+        "wizard_csv_filename": None,    # CSV filename before planning exists
         "wizard_tasks_df": None,
         "wizard_filtered_tasks_df": None,
         "wizard_selected_df": None,
@@ -241,6 +243,8 @@ def _reset_wizard():
     st.session_state["wizard_planning_id"] = None
     st.session_state["wizard_active_section"] = 1
     st.session_state["wizard_mapping"] = {}
+    st.session_state["wizard_csv_bytes"] = None
+    st.session_state["wizard_csv_filename"] = None
     st.session_state["wizard_tasks_df"] = None
     st.session_state["wizard_filtered_tasks_df"] = None
     st.session_state["wizard_selected_df"] = None
@@ -532,62 +536,121 @@ def _prepare_tasks_for_planning(selected_df):
 
 
 def _prepare_manual_actions_df(actions_df):
+    """Prepare manual actions for scheduling.
+
+    FIX #2: Actions manuelles no longer require atelier/equipe.
+    Required fields: description + slot_type (+ optionally start_time / duration_hours).
+    Rows with no description are dropped; atelier stays empty if not provided.
+    """
+    _EMPTY_COLS = ["task_id", "ot_id", "description", "equipment_desc", "equipment",
+                   "atelier", "duration_h", "predecessor_ot", "forced_start_dt",
+                   "forced_teams_list", "priority_score", "status", "slot_type"]
+
     if actions_df is None or actions_df.empty:
-        return pd.DataFrame(columns=["task_id", "ot_id", "description", "equipment_desc", "equipment", "atelier", "duration_h", "predecessor_ot", "forced_start_dt", "forced_teams_list", "priority_score", "status", "slot_type"])
+        return pd.DataFrame(columns=_EMPTY_COLS)
 
     df = actions_df.copy()
 
-    # BUG FIX #5: Drop rows that are completely empty (no description, no atelier, no duration)
-    df = df[
-        (df.get("description", pd.Series([""] * len(df))).astype(str).str.strip() != "") |
-        (df.get("atelier", pd.Series([""] * len(df))).astype(str).str.strip() != "")
-    ].copy()
+    # Only require a non-empty description — atelier is now optional
+    if "description" in df.columns:
+        df = df[df["description"].astype(str).str.strip() != ""].copy()
 
     if df.empty:
-        return pd.DataFrame(columns=["task_id", "ot_id", "description", "equipment_desc", "equipment", "atelier", "duration_h", "predecessor_ot", "forced_start_dt", "forced_teams_list", "priority_score", "status", "slot_type"])
+        return pd.DataFrame(columns=_EMPTY_COLS)
 
-    df["action_id"] = df["action_id"].replace("", pd.NA)
-    if len(df) > 0:
-        fallback_ids = [f"ACT_{i+1}" for i in range(len(df))]
-        df["action_id"] = df["action_id"].fillna(pd.Series(fallback_ids, index=df.index))
+    # Auto-assign IDs
+    df["action_id"] = df.get("action_id", pd.Series([""] * len(df))).replace("", pd.NA)
+    fallback_ids = [f"ACT_{i+1}" for i in range(len(df))]
+    df["action_id"] = df["action_id"].fillna(pd.Series(fallback_ids, index=df.index))
+
     df["task_id"] = df["action_id"].astype(str)
     df["ot_id"] = df["action_id"].astype(str)
     df["equipment_desc"] = ""
     df["equipment"] = ""
     df["predecessor_ot"] = ""
-    df["forced_teams_list"] = df["forced_team"].apply(lambda x: [t.strip() for t in re.split(r"[;,]", str(x)) if t.strip()])
-    df["forced_start_dt"] = df["forced_start"].apply(lambda x: _normalize_ts(_parse_dt_any(x, None)))
-    df["duration_h"] = pd.to_numeric(df["duration_hours"], errors="coerce").fillna(0.0)
+
+    # atelier is optional — default to empty string
+    if "atelier" not in df.columns:
+        df["atelier"] = ""
+    else:
+        df["atelier"] = df["atelier"].fillna("").astype(str)
+
+    # forced_team is optional
+    if "forced_team" not in df.columns:
+        df["forced_team"] = ""
+    df["forced_teams_list"] = df["forced_team"].apply(
+        lambda x: [t.strip() for t in re.split(r"[;,]", str(x)) if t.strip()]
+    )
+
+    # start_time → forced_start_dt (new simplified field)
+    # Support both old "forced_start" and new "start_time" columns
+    forced_src = df.get("start_time", df.get("forced_start", pd.Series([""] * len(df), index=df.index)))
+    df["forced_start_dt"] = forced_src.apply(lambda x: _normalize_ts(_parse_dt_any(x, None)))
+
+    df["duration_h"] = pd.to_numeric(df.get("duration_hours", 1.0), errors="coerce").fillna(1.0)
     df["priority_score"] = 999
     df["status"] = "manual"
 
-    # BUG FIX #5: slot_type must default to "DURING" to avoid being filtered out
+    # Slot type default = DURING
     if "slot_type" not in df.columns:
         df["slot_type"] = "DURING"
     else:
         df["slot_type"] = df["slot_type"].fillna("DURING").replace("", "DURING")
 
-    print(f"[DEBUG manual actions] {len(df)} action(s) préparée(s) pour le planning:")
+    print(f"[DEBUG manual actions] {len(df)} action(s) à planifier:")
     for _, r in df.iterrows():
-        print(f"  → {r['task_id']} | atelier={r['atelier']} | durée={r['duration_h']}h | slot={r['slot_type']}")
+        print(f"  → {r['task_id']} | atelier='{r['atelier']}' | durée={r['duration_h']}h | slot={r['slot_type']} | start={r['forced_start_dt']}")
 
-    return df[
-        [
-            "task_id",
-            "ot_id",
-            "description",
-            "equipment_desc",
-            "equipment",
-            "atelier",
-            "duration_h",
-            "predecessor_ot",
-            "forced_start_dt",
-            "forced_teams_list",
-            "priority_score",
-            "status",
-            "slot_type",
-        ]
-    ].copy()
+    return df[_EMPTY_COLS].copy()
+
+
+def _next_valid_slot(current_ts, duration_h: float, site_open_hhmm: str, site_close_hhmm: str):
+    """Find the next start/end pair that fits within site daily hours.
+
+    FIX #8: The previous scheduler ignored daily site hours — tasks could overflow midnight.
+    Now tasks are bounded by site_open→site_close each day, and pushed to the next day
+    if they don't fit in the remaining day hours.
+
+    Returns (start, end) as pd.Timestamps, or (None, None) if not schedulable.
+    """
+    from datetime import timedelta as _td
+
+    def _hm(hhmm):
+        h, m = map(int, hhmm.split(":"))
+        return h, m
+
+    open_h, open_m = _hm(site_open_hhmm)
+    close_h, close_m = _hm(site_close_hhmm)
+    day_cap_h = (close_h * 60 + close_m - open_h * 60 - open_m) / 60.0
+
+    if duration_h <= 0:
+        duration_h = 0.5
+    if duration_h > day_cap_h:
+        # Clamp to day capacity — task is too long for a single shift
+        duration_h = day_cap_h
+
+    ts = pd.Timestamp(current_ts)
+    for _ in range(730):  # safety: max 2 years of days
+        day_open = ts.replace(hour=open_h, minute=open_m, second=0, microsecond=0)
+        day_close = ts.replace(hour=close_h, minute=close_m, second=0, microsecond=0)
+
+        # Before site opens today → jump to opening
+        if ts < day_open:
+            ts = day_open
+
+        # Past close today → jump to opening of next day
+        if ts >= day_close:
+            ts = (ts + _td(days=1)).replace(hour=open_h, minute=open_m, second=0, microsecond=0)
+            continue
+
+        end_candidate = ts + pd.Timedelta(hours=duration_h)
+        if end_candidate <= day_close:
+            return ts, end_candidate
+
+        # Doesn't fit in remaining time today → push to next day
+        ts = (ts + _td(days=1)).replace(hour=open_h, minute=open_m, second=0, microsecond=0)
+
+    return None, None
 
 
 def _choose_candidate_resources(candidates, forced_teams):
@@ -604,7 +667,9 @@ def _choose_candidate_resources(candidates, forced_teams):
     ]
 
 
-def _schedule_standard_tasks(tasks_df, resources_by_atelier, window_start, window_end, allow_overrun=False):
+def _schedule_standard_tasks(tasks_df, resources_by_atelier, window_start, window_end,
+                              allow_overrun=False,
+                              site_open_hhmm="00:00", site_close_hhmm="23:59"):
     planning_rows = []
     unscheduled_rows = []
     scheduled_map = {}
@@ -697,7 +762,7 @@ def _schedule_standard_tasks(tasks_df, resources_by_atelier, window_start, windo
             best_end = None
 
             for c in candidates:
-                start_candidate = max(
+                raw_start = max(
                     _normalize_ts(c["current"]),
                     pred_end,
                     _normalize_ts(c["available_from"]),
@@ -705,16 +770,27 @@ def _schedule_standard_tasks(tasks_df, resources_by_atelier, window_start, windo
                 )
 
                 if forced_start is not None:
-                    start_candidate = max(start_candidate, forced_start)
+                    raw_start = max(raw_start, forced_start)
 
+                if raw_start >= _normalize_ts(c["available_to"]):
+                    continue
+
+                # FIX #8: respect daily site hours — find the next valid slot
+                start_candidate, end_candidate = _next_valid_slot(
+                    raw_start, duration, site_open_hhmm, site_close_hhmm
+                )
+                if start_candidate is None:
+                    continue
+
+                # Resource availability bounds
                 if start_candidate >= _normalize_ts(c["available_to"]):
                     continue
 
-                end_candidate = start_candidate + pd.Timedelta(hours=duration)
+                hard_limit = _normalize_ts(c["available_to"])
+                if not allow_overrun:
+                    hard_limit = min(hard_limit, window_end)
 
-                if not allow_overrun and end_candidate > min(window_end, _normalize_ts(c["available_to"])):
-                    continue
-                if allow_overrun and end_candidate > _normalize_ts(c["available_to"]):
+                if end_candidate > hard_limit:
                     continue
 
                 if best_end is None or end_candidate < best_end:
@@ -768,8 +844,81 @@ def _build_coactivity_df(selected_df):
     return grp[["Equipement", "OT selectionnes"]]
 
 
+def _place_global_manual_actions(manual_df, window_start, window_end, planning_rows_so_far,
+                                   site_open_hhmm, site_close_hhmm):
+    """Place manual actions that have no atelier (global / non-routed actions).
+
+    FIX #2: START → before window_start (at site_open - duration or forced_start)
+             END   → after last planned OT or window_end (at forced_start or window_end)
+             DURING → at forced_start or window_start
+
+    Returns a list of planning_rows dicts (already with planned_start_at / planned_end_at).
+    """
+    from datetime import timedelta as _td
+
+    if manual_df is None or manual_df.empty:
+        return []
+
+    # Only process rows without atelier
+    no_atelier = manual_df[manual_df["atelier"].astype(str).str.strip() == ""].copy()
+    if no_atelier.empty:
+        return []
+
+    # Latest planned end across all already-scheduled tasks
+    latest_planned_end = window_end
+    for row in planning_rows_so_far:
+        pe = _normalize_ts(row.get("planned_end_at"))
+        if pe and pe > latest_planned_end:
+            latest_planned_end = pe
+
+    placed = []
+    for _, r in no_atelier.iterrows():
+        duration = max(float(r.get("duration_h", 1.0) or 1.0), 0.25)
+        forced = _normalize_ts(r.get("forced_start_dt"))
+        slot = str(r.get("slot_type", "DURING")).upper()
+
+        if forced is not None:
+            start = forced
+        elif slot == "START":
+            # Place just before window_start
+            start = window_start - pd.Timedelta(hours=duration)
+            # Ensure within site hours
+            s2, _ = _next_valid_slot(start, duration, site_open_hhmm, site_close_hhmm)
+            if s2 is not None:
+                start = s2
+        elif slot == "END":
+            start = latest_planned_end
+            s2, _ = _next_valid_slot(start, duration, site_open_hhmm, site_close_hhmm)
+            if s2 is not None:
+                start = s2
+        else:  # DURING
+            start = window_start
+            s2, _ = _next_valid_slot(start, duration, site_open_hhmm, site_close_hhmm)
+            if s2 is not None:
+                start = s2
+
+        end = start + pd.Timedelta(hours=duration)
+
+        rr = dict(r)
+        rr["planned_start_at"] = start
+        rr["planned_end_at"] = end
+        rr["planned_team_name"] = "Manuel"
+        rr["commentaire"] = f"Action manuelle ({slot})"
+        placed.append(rr)
+
+        # Update latest_planned_end so subsequent END actions chain
+        if end > latest_planned_end:
+            latest_planned_end = end
+
+    return placed
+
+
 def _generate_schedule(selected_df, teams_df, planning, manual_actions_df=None):
     selected_ateliers = sorted([x for x in selected_df["atelier"].dropna().astype(str).unique().tolist() if x])
+
+    # FIX #8: extract site hours from planning
+    site_open = getattr(planning, "site_open", None) or "00:00"
+    site_close = getattr(planning, "site_close", None) or "23:59"
 
     resources_by_atelier = _build_resources_from_team_rosters(
         selected_ateliers=selected_ateliers,
@@ -781,8 +930,13 @@ def _generate_schedule(selected_df, teams_df, planning, manual_actions_df=None):
     all_tasks = _prepare_tasks_for_planning(selected_df)
 
     manual_df = _prepare_manual_actions_df(manual_actions_df)
-    if not manual_df.empty:
-        all_tasks = pd.concat([manual_df, all_tasks], ignore_index=True)
+
+    # Split manual into routed (have atelier) and global (no atelier)
+    manual_routed = manual_df[manual_df["atelier"].astype(str).str.strip() != ""].copy() if not manual_df.empty else pd.DataFrame()
+    manual_global = manual_df[manual_df["atelier"].astype(str).str.strip() == ""].copy() if not manual_df.empty else pd.DataFrame()
+
+    if not manual_routed.empty:
+        all_tasks = pd.concat([manual_routed, all_tasks], ignore_index=True)
 
     planning_rows = []
     unscheduled_rows = []
@@ -801,19 +955,35 @@ def _generate_schedule(selected_df, teams_df, planning, manual_actions_df=None):
     latest_end = _normalize_ts(latest_end)
 
     if not start_df.empty:
-        pr, ur, _ = _schedule_standard_tasks(start_df, resources_by_atelier, window_start, window_end, allow_overrun=False)
+        pr, ur, _ = _schedule_standard_tasks(
+            start_df, resources_by_atelier, window_start, window_end,
+            allow_overrun=False, site_open_hhmm=site_open, site_close_hhmm=site_close,
+        )
         planning_rows += pr
         unscheduled_rows += ur
 
     if not during_df.empty:
-        pr, ur, _ = _schedule_standard_tasks(during_df, resources_by_atelier, window_start, latest_end, allow_overrun=True)
+        pr, ur, _ = _schedule_standard_tasks(
+            during_df, resources_by_atelier, window_start, latest_end,
+            allow_overrun=True, site_open_hhmm=site_open, site_close_hhmm=site_close,
+        )
         planning_rows += pr
         unscheduled_rows += ur
 
     if not end_df.empty:
-        pr, ur, _ = _schedule_standard_tasks(end_df, resources_by_atelier, window_end, latest_end, allow_overrun=True)
+        pr, ur, _ = _schedule_standard_tasks(
+            end_df, resources_by_atelier, window_end, latest_end,
+            allow_overrun=True, site_open_hhmm=site_open, site_close_hhmm=site_close,
+        )
         planning_rows += pr
         unscheduled_rows += ur
+
+    # FIX #2: place global manual actions (no atelier) directly
+    global_placed = _place_global_manual_actions(
+        manual_global, window_start, window_end, planning_rows,
+        site_open, site_close,
+    )
+    planning_rows += global_placed
 
     planning_df = pd.DataFrame(planning_rows)
     unscheduled_df = pd.DataFrame(unscheduled_rows)
@@ -846,7 +1016,16 @@ def _generate_schedule(selected_df, teams_df, planning, manual_actions_df=None):
             mask = result["ot_id"] == str(row["ot_id"])
             result.loc[mask, "selected_warning"] = row.get("reason", "Non planifie")
 
-    manual_result = planning_df[planning_df["task_id"].astype(str).str.startswith("ACT_")].copy() if not planning_df.empty else pd.DataFrame()
+    manual_from_df = planning_df[planning_df["task_id"].astype(str).str.startswith("ACT_")].copy() if not planning_df.empty else pd.DataFrame()
+
+    # Add globally-placed manual actions (no atelier) to manual_result
+    global_df = pd.DataFrame(global_placed) if global_placed else pd.DataFrame()
+    if not global_df.empty and not manual_from_df.empty:
+        manual_result = pd.concat([manual_from_df, global_df], ignore_index=True)
+    elif not global_df.empty:
+        manual_result = global_df
+    else:
+        manual_result = manual_from_df
 
     return result, unscheduled_df, manual_result
 
@@ -1150,42 +1329,50 @@ def _render_rex_panel(session, user, planning_id):
 # GANTT + PDF HELPERS
 # =========================================================
 
-_GANTT_COLORS = [
-    "#4B7BE5", "#E55C5C", "#5CB85C", "#9B59B6",
-    "#3CBFCF", "#2ECC71", "#E91E8C", "#FF6B35",
-]
+# FIX #7: Mainnovation Gantt colour palette — greys per team, orange for manual
 _MN_ORANGE = "#F5A623"
+_MN_GREY_PALETTE = ["#6B6B6B", "#8A8A8A", "#ABABAB", "#C0C0C0", "#505050", "#3A3A3A", "#9E9E9E", "#757575"]
 
 
 def _render_gantt(generated_df: "pd.DataFrame", planning, manual_df=None) -> None:
-    """Render an interactive Gantt chart using Plotly timeline."""
+    """Render interactive Gantt by TEAM (not atelier) using Plotly.
+
+    FIX #3: y-axis is now planned_team_name (one row per team, not per atelier).
+    FIX #4: Day separator vertical lines at each midnight.
+    FIX #7: Mainnovation grey palette for teams, orange for manual actions.
+    """
     try:
         df = generated_df.copy()
         df["_start"] = pd.to_datetime(df["planned_start_at"], errors="coerce")
-        df["_end"] = pd.to_datetime(df["planned_end_at"], errors="coerce")
+        df["_end"]   = pd.to_datetime(df["planned_end_at"],   errors="coerce")
         df = df.dropna(subset=["_start", "_end"])
         df["is_manual"] = False
-        df["_type"] = df["atelier"].astype(str)
+        # FIX #3: use planned_team_name as y-axis row
+        df["_row"]   = df.get("planned_team_name", df.get("atelier", "")).astype(str)
+        df["_row"]   = df["_row"].where(df["_row"].str.strip() != "", df.get("atelier", "").astype(str))
+        df["_color"] = df["_row"]   # colour by team
         df["_label"] = df["ot_id"].astype(str)
-        df["_desc"] = df.get("description", "").astype(str).apply(lambda x: x[:60])
-        df["_team"] = df.get("planned_team_name", "").astype(str)
-        df["_dur"] = df.get("duration_hours", 0).apply(lambda x: f"{round(float(x or 0), 1)} h")
+        df["_desc"]  = df.get("description", "").astype(str).str[:60]
+        df["_team"]  = df["_row"]
+        df["_dur"]   = df.get("duration_hours", 0).apply(lambda x: f"{round(float(x or 0), 1)} h")
 
-        # Merge manual actions with distinct colour
+        # Merge manual actions
         if manual_df is not None and not manual_df.empty:
             mdf = manual_df.copy()
             mdf["_start"] = pd.to_datetime(mdf["planned_start_at"], errors="coerce")
-            mdf["_end"] = pd.to_datetime(mdf["planned_end_at"], errors="coerce")
+            mdf["_end"]   = pd.to_datetime(mdf["planned_end_at"],   errors="coerce")
             mdf = mdf.dropna(subset=["_start", "_end"])
             if not mdf.empty:
                 mdf["is_manual"] = True
-                mdf["atelier"] = mdf.get("atelier", mdf.get("task_id", "Manuel")).astype(str)
-                mdf["_type"] = "Action manuelle"
+                team_col = mdf.get("planned_team_name", mdf.get("atelier", pd.Series(["Manuel"] * len(mdf), index=mdf.index)))
+                mdf["_row"]   = team_col.fillna("Manuel").astype(str)
+                mdf["_color"] = "Action manuelle"   # distinct orange
                 mdf["_label"] = mdf.get("ot_id", mdf.get("task_id", "")).astype(str)
-                mdf["_desc"] = mdf.get("description", "").astype(str).apply(lambda x: x[:60])
-                mdf["_team"] = mdf.get("planned_team_name", "").astype(str)
-                mdf["_dur"] = mdf.get("duration_h", mdf.get("duration_hours", 0)).apply(lambda x: f"{round(float(x or 0), 1)} h")
-                common_cols = ["atelier", "_start", "_end", "_type", "_label", "_desc", "_team", "_dur", "is_manual"]
+                mdf["_desc"]  = mdf.get("description", "").astype(str).str[:60]
+                mdf["_team"]  = mdf["_row"]
+                dur_src = mdf.get("duration_h", mdf.get("duration_hours", pd.Series([0] * len(mdf), index=mdf.index)))
+                mdf["_dur"] = dur_src.apply(lambda x: f"{round(float(x or 0), 1)} h")
+                common_cols = ["_row", "_start", "_end", "_color", "_label", "_desc", "_team", "_dur", "is_manual"]
                 df = pd.concat([df[common_cols], mdf[common_cols]], ignore_index=True)
 
         if df.empty:
@@ -1193,27 +1380,21 @@ def _render_gantt(generated_df: "pd.DataFrame", planning, manual_df=None) -> Non
             return
 
         if not _PLOTLY_AVAILABLE:
-            # Fallback to matplotlib
             _render_gantt_matplotlib(df, planning)
             return
 
-        # Build colour map
-        types = df["_type"].unique().tolist()
-        color_map = {}
-        palette_idx = 0
-        for t in types:
-            if t == "Action manuelle":
-                color_map[t] = _MN_ORANGE
-            else:
-                color_map[t] = _GANTT_COLORS[palette_idx % len(_GANTT_COLORS)]
-                palette_idx += 1
+        # Build colour map: teams → grey shades, manual → orange
+        teams = [t for t in df["_color"].unique().tolist() if t != "Action manuelle"]
+        color_map = {"Action manuelle": _MN_ORANGE}
+        for i, t in enumerate(sorted(teams)):
+            color_map[t] = _MN_GREY_PALETTE[i % len(_MN_GREY_PALETTE)]
 
         fig = px.timeline(
             df,
             x_start="_start",
             x_end="_end",
-            y="atelier",
-            color="_type",
+            y="_row",
+            color="_color",
             text="_label",
             hover_data={
                 "_label": True,
@@ -1222,47 +1403,85 @@ def _render_gantt(generated_df: "pd.DataFrame", planning, manual_df=None) -> Non
                 "_end": True,
                 "_dur": True,
                 "_team": True,
-                "_type": False,
-                "atelier": False,
+                "_color": False,
+                "_row": False,
             },
             labels={
-                "_label": "N° OT",
+                "_label": "N° OT / Action",
                 "_desc": "Description",
                 "_start": "Début",
                 "_end": "Fin",
                 "_dur": "Durée",
                 "_team": "Équipe",
+                "_row": "Équipe",
             },
             color_discrete_map=color_map,
         )
 
-        fig.update_yaxes(autorange="reversed", title="Atelier / Équipe")
+        # FIX #4: add vertical day-separator lines at each midnight within the planning range
+        if not df["_start"].isna().all():
+            range_start = df["_start"].min().normalize()  # midnight of first day
+            range_end   = df["_end"].max()
+            day = range_start + pd.Timedelta(days=1)
+            while day <= range_end + pd.Timedelta(days=1):
+                fig.add_vline(
+                    x=day.timestamp() * 1000,  # Plotly uses ms since epoch
+                    line_width=2,
+                    line_dash="dot",
+                    line_color=_MN_ORANGE,
+                    opacity=0.7,
+                )
+                # Date annotation at top of separator
+                fig.add_annotation(
+                    x=day.timestamp() * 1000,
+                    y=1.02,
+                    xref="x",
+                    yref="paper",
+                    text=day.strftime("%d/%m"),
+                    showarrow=False,
+                    font=dict(size=10, color=_MN_ORANGE, family="Arial"),
+                    bgcolor="#FFF3E0",
+                    bordercolor=_MN_ORANGE,
+                    borderwidth=1,
+                )
+                day += pd.Timedelta(days=1)
+
+        fig.update_yaxes(autorange="reversed", title="Équipe", tickfont=dict(size=11))
         fig.update_xaxes(
             title="Horaire",
             showgrid=True,
             gridwidth=1,
-            gridcolor="#E0E0E0",
-            tickformat="%d/%m\n%H:%M",
+            gridcolor="#E8E8E8",
+            tickformat="%d/%m %H:%M",
+            tickfont=dict(size=10),
         )
         fig.update_traces(
             textposition="inside",
             insidetextanchor="middle",
-            textfont=dict(size=11, color="white", family="Arial Black"),
+            textfont=dict(size=10, color="white", family="Arial"),
         )
         fig.update_layout(
-            title=dict(text=f"Gantt — {planning.name}", font=dict(size=16, color="#6B6B6B")),
+            title=dict(
+                text=f"<b>Gantt — {planning.name}</b>",
+                font=dict(size=15, color="#6B6B6B"),
+            ),
             plot_bgcolor="#FFFFFF",
             paper_bgcolor="#F2F2F2",
             legend=dict(
                 orientation="h",
                 yanchor="top",
-                y=-0.15,
+                y=-0.12,
                 xanchor="left",
                 x=0,
-                title="Équipes / Types",
+                title="Équipes",
+                font=dict(size=10),
+                bgcolor="#F2F2F2",
+                bordercolor="#6B6B6B",
+                borderwidth=1,
             ),
             hovermode="closest",
-            margin=dict(l=20, r=20, t=50, b=80),
+            hoverlabel=dict(bgcolor="#FFF3E0", bordercolor=_MN_ORANGE, font_size=12),
+            margin=dict(l=30, r=30, t=60, b=100),
         )
 
         st.plotly_chart(fig, use_container_width=True)
@@ -1274,32 +1493,34 @@ def _render_gantt(generated_df: "pd.DataFrame", planning, manual_df=None) -> Non
 
 
 def _render_gantt_matplotlib(df, planning):
-    """Fallback Gantt renderer using matplotlib (used when Plotly is not available)."""
+    """Fallback Gantt renderer using matplotlib when Plotly is unavailable."""
     try:
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
         import matplotlib.dates as mdates
 
-        ateliers = df["atelier"].unique().tolist()
-        colors = {a: _GANTT_COLORS[i % len(_GANTT_COLORS)] for i, a in enumerate(ateliers)}
+        rows = df["_row"].unique().tolist()
+        colors = {r: (_MN_ORANGE if df[df["_row"] == r]["is_manual"].any()
+                      else _MN_GREY_PALETTE[i % len(_MN_GREY_PALETTE)])
+                  for i, r in enumerate(rows)}
 
-        fig_h = max(3.5, len(ateliers) * 0.9 + 2)
+        fig_h = max(3.5, len(rows) * 0.9 + 2)
         fig, ax = plt.subplots(figsize=(14, fig_h))
 
-        for i, atelier in enumerate(ateliers):
-            sub = df[df["atelier"] == atelier]
+        for i, row_key in enumerate(rows):
+            sub = df[df["_row"] == row_key]
             for _, row in sub.iterrows():
                 t0 = mdates.date2num(row["_start"].to_pydatetime())
                 t1 = mdates.date2num(row["_end"].to_pydatetime())
                 dur = max(t1 - t0, 1e-4)
-                fc = _MN_ORANGE if row.get("is_manual") else colors[atelier]
+                fc = _MN_ORANGE if row.get("is_manual") else colors[row_key]
                 ax.broken_barh([(t0, dur)], (i - 0.38, 0.76), facecolors=fc, edgecolors="#fff", linewidth=0.8)
                 ax.text(t0 + dur / 2, i, str(row.get("_label", ""))[:10],
                         ha="center", va="center", fontsize=6.5, color="#fff", fontweight="bold")
 
-        ax.set_yticks(range(len(ateliers)))
-        ax.set_yticklabels(ateliers, fontsize=9)
+        ax.set_yticks(range(len(rows)))
+        ax.set_yticklabels(rows, fontsize=9)
         ax.xaxis_date()
         ax.xaxis.set_major_formatter(mdates.DateFormatter("%d/%m\n%H:%M"))
         ax.xaxis.set_major_locator(mdates.AutoDateLocator())
@@ -1419,124 +1640,294 @@ def _generate_planning_pdf(generated_df: "pd.DataFrame", planning) -> bytes:
     return bytes(raw) if not isinstance(raw, bytes) else raw
 
 
+def _generate_planning_html_LEGACY(generated_df, planning, manual_df=None) -> bytes:
+    """Legacy simple HTML export — kept for reference."""
+    return _generate_planning_html(generated_df, planning, manual_df)
+
+
 def _generate_planning_html(generated_df: "pd.DataFrame", planning, manual_df=None) -> bytes:
-    """Generate a standalone HTML planning export with Mainnovation styling.
+    """Generate a Microsoft-Project-style HTML Gantt planning export.
 
-    Returns UTF-8 encoded bytes ready for st.download_button.
+    FIX #6: Replaces the simple HTML table with a proper Gantt table:
+    - Header: planning name, sectors, dates, ateliers
+    - Column hierarchy: N°, Nom tâche, Durée, Début, Fin + hourly time columns per day
+    - Gantt bars rendered as colored CSS cells inside the table
+    - Hierarchy: Fenêtre d'arrêt > Atelier > Équipe > OT
+    - Manual actions in orange (#F5A623)
+    - A3 landscape print-optimized
     """
+    from datetime import timedelta as _td, date as _date
+
     df = generated_df.copy()
+    plan_name   = str(planning.name or "")
+    start_str   = str(planning.start_at)[:19] if planning.start_at else ""
+    end_str     = str(planning.end_at)[:19]   if planning.end_at   else ""
+    sectors     = str(getattr(planning, "sectors_csv", "") or "")
+    site_open   = getattr(planning, "site_open",  None) or "07:00"
+    site_close  = getattr(planning, "site_close", None) or "22:00"
 
-    plan_name = str(planning.name or "")
-    start_str = str(planning.start_at)[:19] if planning.start_at else ""
-    end_str = str(planning.end_at)[:19] if planning.end_at else ""
-    sectors = str(getattr(planning, "sectors_csv", "") or "")
+    # Parse site hours
+    so_h, so_m = map(int, site_open.split(":"))
+    sc_h, sc_m = map(int, site_close.split(":"))
+    hours_per_day = list(range(so_h, sc_h + 1))  # e.g. [7,8,...,22]
 
-    n_ot = len(df)
-    total_h = round(float(df["duration_hours"].sum()) if "duration_hours" in df.columns else 0, 1)
-    ateliers = df["atelier"].dropna().astype(str).unique().tolist() if "atelier" in df.columns else []
+    # Date range
+    df["_start"] = pd.to_datetime(df["planned_start_at"], errors="coerce")
+    df["_end"]   = pd.to_datetime(df["planned_end_at"],   errors="coerce")
+    df_valid = df.dropna(subset=["_start", "_end"])
 
-    # Build rows
-    display_cols = ["ot_id", "description", "atelier", "duration_hours", "planned_start_at", "planned_end_at", "planned_team_name"]
-    display_cols = [c for c in display_cols if c in df.columns]
-    col_labels = {
-        "ot_id": "N° OT", "description": "Description", "atelier": "Atelier",
-        "duration_hours": "Durée (h)", "planned_start_at": "Début",
-        "planned_end_at": "Fin", "planned_team_name": "Équipe",
-    }
-
-    thead = "".join(f"<th>{col_labels.get(c, c)}</th>" for c in display_cols)
-    tbody_rows = []
-    for i, (_, row) in enumerate(df[display_cols].iterrows()):
-        bg = "#fde8c0" if i % 2 == 0 else "#ffffff"
-        cells = ""
-        for c in display_cols:
-            val = row.get(c, "")
-            if c == "duration_hours":
-                try:
-                    val = round(float(val or 0), 1)
-                except Exception:
-                    val = 0
-            cells += f"<td>{val}</td>"
-        tbody_rows.append(f'<tr style="background:{bg}">{cells}</tr>')
-    tbody = "\n".join(tbody_rows)
-
-    # Manual actions section
-    manual_section = ""
     if manual_df is not None and not manual_df.empty:
-        mrows = []
-        for i, (_, row) in enumerate(manual_df.iterrows()):
-            bg = "#fff3e0" if i % 2 == 0 else "#ffffff"
-            ot = row.get("ot_id", row.get("task_id", ""))
-            desc = row.get("description", "")
-            at = row.get("atelier", "")
-            dur = row.get("duration_h", row.get("duration_hours", 0))
-            try:
-                dur = round(float(dur or 0), 1)
-            except Exception:
-                dur = 0
-            ps = str(row.get("planned_start_at", ""))[:16]
-            pe = str(row.get("planned_end_at", ""))[:16]
-            team = row.get("planned_team_name", "")
-            mrows.append(f'<tr style="background:{bg}"><td>{ot}</td><td>{desc}</td><td>{at}</td><td>{dur}</td><td>{ps}</td><td>{pe}</td><td>{team}</td></tr>')
-        manual_section = f"""
-        <h2 style="color:#F5A623;margin-top:32px">Actions manuelles planifiées</h2>
-        <table>
-          <thead><tr><th>ID Action</th><th>Description</th><th>Atelier</th><th>Durée (h)</th><th>Début</th><th>Fin</th><th>Équipe</th></tr></thead>
-          <tbody>{"".join(mrows)}</tbody>
-        </table>
-        """
+        mdf_v = manual_df.copy()
+        mdf_v["_start"] = pd.to_datetime(mdf_v["planned_start_at"], errors="coerce")
+        mdf_v["_end"]   = pd.to_datetime(mdf_v["planned_end_at"],   errors="coerce")
+        mdf_v = mdf_v.dropna(subset=["_start", "_end"])
+    else:
+        mdf_v = pd.DataFrame()
+
+    all_starts = list(df_valid["_start"]) + (list(mdf_v["_start"]) if not mdf_v.empty else [])
+    all_ends   = list(df_valid["_end"])   + (list(mdf_v["_end"])   if not mdf_v.empty else [])
+
+    if not all_starts:
+        # Fallback if no dates
+        return ("<html><body><p>Aucune donnée planifiée.</p></body></html>").encode("utf-8")
+
+    first_day = min(all_starts).normalize()
+    last_day  = max(all_ends).normalize()
+    days: list = []
+    d = first_day
+    while d <= last_day:
+        days.append(d)
+        d += pd.Timedelta(days=1)
+
+    n_days  = len(days)
+    n_hours = len(hours_per_day)
+    n_fixed = 5  # N°, Nom tâche, Durée, Début, Fin
+
+    # ── Build Gantt bar for a single cell (day d, hour h) ──────────────────
+    def _bar_pct(task_start, task_end, day_ts, hour_int, is_manual=False):
+        """Return (left_pct, width_pct, color) or None if no overlap."""
+        cell_s = day_ts.replace(hour=hour_int, minute=0, second=0, microsecond=0)
+        cell_e = cell_s + pd.Timedelta(hours=1)
+        overlap_s = max(task_start, cell_s)
+        overlap_e = min(task_end,   cell_e)
+        if overlap_e <= overlap_s:
+            return None
+        left_pct  = (overlap_s - cell_s).total_seconds() / 3600 * 100
+        width_pct = (overlap_e - overlap_s).total_seconds() / 3600 * 100
+        color = "#F5A623" if is_manual else "#6B6B6B"
+        return left_pct, width_pct, color
+
+    def _gantt_cell(task_start, task_end, day_ts, hour_int, is_manual=False):
+        bar = _bar_pct(task_start, task_end, day_ts, hour_int, is_manual)
+        if bar is None:
+            return "<td class='gc'></td>"
+        l, w, c = bar
+        return (f"<td class='gc'>"
+                f"<div class='bar' style='left:{l:.0f}%;width:{w:.0f}%;background:{c}'></div>"
+                f"</td>")
+
+    # ── Header row 1: day labels (spanning n_hours columns each) ───────────
+    day_headers = ""
+    for d_ts in days:
+        label = d_ts.strftime("%A %d/%m/%Y")
+        day_headers += f"<th colspan='{n_hours}' class='day-header'>{label}</th>"
+
+    # ── Header row 2: hour labels ───────────────────────────────────────────
+    hour_headers = ""
+    for _ in days:
+        for h in hours_per_day:
+            hour_headers += f"<th class='hour-header'>{h:02d}</th>"
+
+    # ── Build hierarchy: sort by atelier > team > start ────────────────────
+    df_valid2 = df_valid.copy()
+    df_valid2["atelier"]          = df_valid2.get("atelier", "").astype(str)
+    df_valid2["planned_team_name"]= df_valid2.get("planned_team_name", "").astype(str)
+
+    ateliers_list = sorted(df_valid2["atelier"].unique().tolist())
+    n_ot     = len(df_valid2) + (len(mdf_v) if not mdf_v.empty else 0)
+    total_h  = round(float(df_valid2.get("duration_hours", pd.Series([0])).sum()), 1)
+
+    row_num = [0]
+    rows_html = []
+
+    def _info_cells(n, name, dur, debut, fin, indent=0):
+        pad = indent * 16
+        return (f"<td class='num'>{n}</td>"
+                f"<td class='name' style='padding-left:{pad+8}px'>{name}</td>"
+                f"<td class='dur'>{dur}</td>"
+                f"<td class='ts'>{debut}</td>"
+                f"<td class='ts'>{fin}</td>")
+
+    def _gantt_cells(task_start, task_end, is_manual=False):
+        cells = ""
+        for d_ts in days:
+            for h in hours_per_day:
+                cells += _gantt_cell(task_start, task_end, d_ts, h, is_manual)
+        return cells
+
+    # Fenêtre d'arrêt row (top-level)
+    ws = pd.to_datetime(planning.start_at)
+    we = pd.to_datetime(planning.end_at)
+    rows_html.append(
+        f"<tr class='row-window'>"
+        f"{_info_cells('', 'Fenêtre d\'arrêt', '', str(ws)[:16], str(we)[:16], indent=0)}"
+        f"{_gantt_cells(ws, we, is_manual=False)}"
+        f"</tr>"
+    )
+
+    for atelier in ateliers_list:
+        at_df = df_valid2[df_valid2["atelier"] == atelier].copy()
+        at_start = at_df["_start"].min()
+        at_end   = at_df["_end"].max()
+        at_dur   = round(float(at_df.get("duration_hours", pd.Series([0])).sum()), 1)
+
+        rows_html.append(
+            f"<tr class='row-atelier'>"
+            f"{_info_cells('', atelier, f'{at_dur} h', str(at_start)[:16], str(at_end)[:16], indent=1)}"
+            f"{_gantt_cells(at_start, at_end, is_manual=False)}"
+            f"</tr>"
+        )
+
+        teams_list = sorted(at_df["planned_team_name"].unique().tolist())
+        for team in teams_list:
+            team_df = at_df[at_df["planned_team_name"] == team].copy().sort_values("_start")
+            t_start = team_df["_start"].min()
+            t_end   = team_df["_end"].max()
+            t_dur   = round(float(team_df.get("duration_hours", pd.Series([0])).sum()), 1)
+
+            rows_html.append(
+                f"<tr class='row-team'>"
+                f"{_info_cells('', team, f'{t_dur} h', str(t_start)[:16], str(t_end)[:16], indent=2)}"
+                f"{_gantt_cells(t_start, t_end, is_manual=False)}"
+                f"</tr>"
+            )
+
+            for _, ot_row in team_df.iterrows():
+                row_num[0] += 1
+                ot_id  = str(ot_row.get("ot_id", ""))
+                desc   = str(ot_row.get("description", ""))[:60]
+                dur_h  = round(float(ot_row.get("duration_hours", 0) or 0), 1)
+                debut  = str(ot_row["_start"])[:16]
+                fin    = str(ot_row["_end"])[:16]
+
+                rows_html.append(
+                    f"<tr class='row-ot'>"
+                    f"{_info_cells(row_num[0], f'{ot_id} — {desc}', f'{dur_h} h', debut, fin, indent=3)}"
+                    f"{_gantt_cells(ot_row['_start'], ot_row['_end'], is_manual=False)}"
+                    f"</tr>"
+                )
+
+    # Manual actions
+    if not mdf_v.empty:
+        rows_html.append(
+            f"<tr class='row-atelier' style='background:#FFF3E0'>"
+            f"{_info_cells('', 'Actions manuelles', '', '', '', indent=1)}"
+            f"{''.join('<td class=\"gc\"></td>' for _ in days for _ in hours_per_day)}"
+            f"</tr>"
+        )
+        for _, mr in mdf_v.iterrows():
+            row_num[0] += 1
+            m_id   = str(mr.get("ot_id", mr.get("task_id", "")))
+            m_desc = str(mr.get("description", ""))[:60]
+            m_dur  = round(float(mr.get("duration_h", mr.get("duration_hours", 0)) or 0), 1)
+            m_deb  = str(mr["_start"])[:16]
+            m_fin  = str(mr["_end"])[:16]
+            rows_html.append(
+                f"<tr class='row-ot' style='background:#FFF8F0'>"
+                f"{_info_cells(row_num[0], f'{m_id} — {m_desc}', f'{m_dur} h', m_deb, m_fin, indent=2)}"
+                f"{_gantt_cells(mr['_start'], mr['_end'], is_manual=True)}"
+                f"</tr>"
+            )
+
+    all_rows = "\n".join(rows_html)
+    total_cols = n_fixed + n_days * n_hours
+    header_fixed = "<th>N°</th><th>Nom de la tâche</th><th>Durée</th><th>Début</th><th>Fin</th>"
 
     html = f"""<!DOCTYPE html>
 <html lang="fr">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Planning — {plan_name}</title>
   <style>
+    @page {{ size: A3 landscape; margin: 10mm; }}
     * {{ box-sizing: border-box; margin: 0; padding: 0; }}
-    body {{ font-family: Arial, sans-serif; color: #6B6B6B; background: #F2F2F2; padding: 24px; }}
-    .header {{ background: #F5A623; color: white; padding: 20px 28px; border-radius: 10px; margin-bottom: 24px; }}
-    .header h1 {{ font-size: 1.6rem; margin-bottom: 6px; }}
-    .header p {{ font-size: 0.95rem; opacity: 0.9; margin: 2px 0; }}
-    .kpis {{ display: flex; gap: 16px; margin-bottom: 24px; }}
-    .kpi {{ background: white; border-left: 4px solid #F5A623; padding: 14px 20px; border-radius: 8px; flex: 1; }}
-    .kpi .val {{ font-size: 1.8rem; font-weight: 700; color: #F5A623; }}
-    .kpi .lbl {{ font-size: 0.85rem; color: #6B6B6B; margin-top: 4px; }}
-    h2 {{ font-size: 1.1rem; color: #6B6B6B; margin-bottom: 12px; }}
-    table {{ width: 100%; border-collapse: collapse; background: white; border-radius: 8px; overflow: hidden; box-shadow: 0 1px 4px rgba(0,0,0,0.08); }}
-    thead tr {{ background: #6B6B6B; }}
-    th {{ color: white; padding: 10px 12px; text-align: left; font-size: 0.85rem; font-weight: 700; }}
-    td {{ padding: 8px 12px; font-size: 0.85rem; border-bottom: 1px solid #f0f0f0; }}
-    .footer {{ text-align: center; margin-top: 32px; font-size: 0.75rem; color: #aaa; }}
+    body {{ font-family: Arial, Helvetica, sans-serif; font-size: 11px; color: #333; background: #F2F2F2; padding: 16px; }}
+    .hdr {{ background: #6B6B6B; color: white; padding: 12px 18px; border-radius: 6px; margin-bottom: 12px; display: flex; justify-content: space-between; align-items: center; }}
+    .hdr h1 {{ font-size: 14px; font-weight: 700; }}
+    .hdr .meta {{ font-size: 10px; opacity: 0.85; }}
+    .kpis {{ display: flex; gap: 10px; margin-bottom: 12px; }}
+    .kpi {{ background: white; border-left: 3px solid #F5A623; padding: 8px 14px; border-radius: 4px; }}
+    .kpi .v {{ font-size: 16px; font-weight: 700; color: #F5A623; }}
+    .kpi .l {{ font-size: 9px; color: #6B6B6B; }}
+    .wrap {{ overflow-x: auto; }}
+    table {{ border-collapse: collapse; white-space: nowrap; background: white; width: 100%; }}
+    th, td {{ border: 1px solid #ddd; padding: 3px 5px; }}
+    th {{ background: #6B6B6B; color: white; font-size: 10px; text-align: center; position: sticky; top: 0; }}
+    .day-header {{ background: #4A4A4A; font-size: 10px; font-weight: 700; text-align: center; }}
+    .hour-header {{ background: #6B6B6B; font-size: 9px; min-width: 24px; max-width: 24px; width: 24px; }}
+    .row-window {{ background: #E8E8E8; font-weight: 700; }}
+    .row-atelier {{ background: #F0F0F0; font-weight: 600; }}
+    .row-team {{ background: #F8F8F8; font-style: italic; }}
+    .row-ot {{ background: #FFFFFF; }}
+    .row-ot:hover {{ background: #FFF3E0; }}
+    .num {{ text-align: center; width: 30px; font-size: 9px; color: #888; }}
+    .name {{ max-width: 220px; overflow: hidden; text-overflow: ellipsis; }}
+    .dur {{ text-align: center; width: 50px; }}
+    .ts {{ width: 110px; font-size: 9px; }}
+    .gc {{ position: relative; min-width: 24px; max-width: 24px; width: 24px; height: 18px; padding: 0; }}
+    .bar {{ position: absolute; top: 2px; height: 14px; border-radius: 2px; opacity: 0.88; }}
+    .footer {{ text-align: center; margin-top: 12px; font-size: 9px; color: #aaa; }}
     @media print {{
-      body {{ padding: 10px; }}
-      .kpis {{ flex-wrap: wrap; }}
+      body {{ padding: 0; background: white; }}
+      .wrap {{ overflow: visible; }}
+      th {{ background: #6B6B6B !important; -webkit-print-color-adjust: exact; print-color-adjust: exact; }}
+      .bar {{ -webkit-print-color-adjust: exact; print-color-adjust: exact; }}
     }}
   </style>
 </head>
 <body>
-  <div class="header">
-    <h1>Planning : {plan_name}</h1>
-    <p>Période : {start_str} → {end_str}</p>
-    {"<p>Secteurs : " + sectors + "</p>" if sectors else ""}
-    <p>Statut : {planning.status}</p>
+  <div class="hdr">
+    <div>
+      <h1>Planning : {plan_name}</h1>
+      <div class="meta">
+        Période : {start_str} → {end_str}
+        {(' &nbsp;|&nbsp; Secteurs : ' + sectors) if sectors else ''}
+        &nbsp;|&nbsp; Plage site : {site_open} – {site_close}
+      </div>
+    </div>
+    <div class="meta">Généré le {datetime.now().strftime("%d/%m/%Y %H:%M")}</div>
   </div>
 
   <div class="kpis">
-    <div class="kpi"><div class="val">{n_ot}</div><div class="lbl">OT planifiés</div></div>
-    <div class="kpi"><div class="val">{total_h} h</div><div class="lbl">Charge totale</div></div>
-    <div class="kpi"><div class="val">{len(ateliers)}</div><div class="lbl">Ateliers</div></div>
+    <div class="kpi"><div class="v">{n_ot}</div><div class="l">OT planifiés</div></div>
+    <div class="kpi"><div class="v">{total_h} h</div><div class="l">Charge totale</div></div>
+    <div class="kpi"><div class="v">{n_days} jour(s)</div><div class="l">Durée planning</div></div>
+    <div class="kpi"><div class="v">{len(ateliers_list)}</div><div class="l">Ateliers</div></div>
   </div>
 
-  <h2>Planning détaillé des OT</h2>
+  <div class="wrap">
   <table>
-    <thead><tr>{thead}</tr></thead>
-    <tbody>{tbody}</tbody>
+    <thead>
+      <tr>
+        {header_fixed}
+        {day_headers}
+      </tr>
+      <tr>
+        <th colspan="{n_fixed}"></th>
+        {hour_headers}
+      </tr>
+    </thead>
+    <tbody>
+      {all_rows}
+    </tbody>
   </table>
+  </div>
 
-  {manual_section}
-
-  <div class="footer">Généré par MaintenOps — Mainnovation &nbsp;|&nbsp; {datetime.now().strftime("%d/%m/%Y %H:%M")}</div>
+  <div class="footer">
+    MaintenOps — Mainnovation &nbsp;|&nbsp; Légende :
+    <span style="display:inline-block;width:14px;height:10px;background:#6B6B6B;vertical-align:middle;border-radius:2px"></span> OT planifiés &nbsp;
+    <span style="display:inline-block;width:14px;height:10px;background:#F5A623;vertical-align:middle;border-radius:2px"></span> Actions manuelles
+  </div>
 </body>
 </html>"""
 
@@ -1707,122 +2098,48 @@ def render_scheduling_module(session, user):
             f"Période : **{planning.start_at} → {planning.end_at}**"
         )
 
-    default_name = planning.name if planning else ""
-    default_sectors = planning.sectors_csv if planning else ""
-    default_start_date = planning.start_at.date() if planning else datetime.now().date()
-    default_end_date = planning.end_at.date() if planning else datetime.now().date()
-    default_daily_open = planning.daily_open if planning else "07:00"
-    default_daily_close = planning.daily_close if planning else "15:00"
-    default_site_open = getattr(planning, "site_open", None) or "06:00" if planning else "06:00"
-    default_site_close = getattr(planning, "site_close", None) or "22:00" if planning else "22:00"
+    # ─────────────────────────────────────────────────────────────────────────
+    # FIX #1 — ÉTAPE 1 : Import CSV + Mapping (AVANT les paramètres)
+    # Cause : l'upload CSV nécessitait un planning.id (créé à l'étape paramètres).
+    # Solution : step 1 stocke csv_bytes en session_state; le planning est créé
+    # à l'étape 2, puis les csv_bytes y sont rattachés.
+    # ─────────────────────────────────────────────────────────────────────────
+    with st.expander("1. Import CSV + Mapping", expanded=st.session_state["wizard_active_section"] == 1):
+        # Support both: uploading a new file OR loading from an existing planning
+        existing_csv_bytes = st.session_state.get("wizard_csv_bytes") or (planning.csv_bytes if planning else None)
+        existing_csv_name  = st.session_state.get("wizard_csv_filename") or (planning.csv_filename if planning else None)
 
-    with st.expander("1. Paramètres de l'arrêt", expanded=st.session_state["wizard_active_section"] == 1):
-        with st.form("create_planning_form"):
-            name = st.text_input("Nom du planning", value=default_name)
-            sectors_txt = st.text_input("Secteurs (séparés par des virgules)", value=default_sectors)
+        if existing_csv_name:
+            st.caption(f"Fichier actuel : **{existing_csv_name}**")
 
-            col1, col2 = st.columns(2)
-            with col1:
-                start_date = st.date_input("Date de début de l'arrêt", value=default_start_date)
-                daily_open = st.text_input(
-                    "🔧 Heure de début de la fenêtre d'arrêt (HH:MM)",
-                    value=default_daily_open,
-                    help="Heure de début des travaux dans la fenêtre d'arrêt (ex : 07:00)",
-                )
-            with col2:
-                end_date = st.date_input("Date de fin de l'arrêt", value=default_end_date)
-                daily_close = st.text_input(
-                    "🔧 Heure de fin de la fenêtre d'arrêt (HH:MM)",
-                    value=default_daily_close,
-                    help="Heure de fin des travaux dans la fenêtre d'arrêt (ex : 15:00)",
-                )
-
-            st.markdown("**Plage horaire du site (multi-jours)**")
-            st.caption("Ces heures définissent la plage autorisée pour planifier des OT sur plusieurs jours. La fenêtre d'arrêt doit être à l'intérieur de ces bornes.")
-            scol1, scol2 = st.columns(2)
-            with scol1:
-                site_open = st.text_input(
-                    "🏭 Heure d'ouverture du site (HH:MM)",
-                    value=default_site_open,
-                    help="Heure à partir de laquelle le site est opérationnel chaque jour (ex : 06:00)",
-                )
-            with scol2:
-                site_close = st.text_input(
-                    "🏭 Heure de fermeture du site (HH:MM)",
-                    value=default_site_close,
-                    help="Heure après laquelle le site ferme chaque jour (ex : 22:00)",
-                )
-
-            submitted = st.form_submit_button("Valider les paramètres", use_container_width=True, type="primary")
-
-        if submitted:
-            try:
-                start_at = _combine_date_time(start_date, daily_open)
-                end_at = _combine_date_time(end_date, daily_close)
-
-                if planning:
-                    planning.name = name.strip()
-                    planning.sectors_csv = sectors_txt.strip()
-                    planning.start_at = start_at
-                    planning.end_at = end_at
-                    planning.daily_open = daily_open
-                    planning.daily_close = daily_close
-                    planning.site_open = site_open
-                    planning.site_close = site_close
-                    planning.updated_at = datetime.now(timezone.utc)
-                    session.commit()
-                else:
-                    planning = Planning(
-                        organization_id=user.organization_id,
-                        created_by_user_id=user.id,
-                        name=name.strip(),
-                        sectors_csv=sectors_txt.strip(),
-                        start_at=start_at,
-                        end_at=end_at,
-                        daily_open=daily_open,
-                        daily_close=daily_close,
-                        site_open=site_open,
-                        site_close=site_close,
-                        status="draft",
-                    )
-                    session.add(planning)
-                    session.commit()
-                    session.refresh(planning)
-                    st.session_state["wizard_planning_id"] = planning.id
-
-                st.session_state["wizard_active_section"] = 2
-
-            except Exception as e:
-                session.rollback()
-                st.error(f"Erreur lors de l'enregistrement des paramètres : {e}")
-
-    planning = _get_current_planning(session, st.session_state["wizard_planning_id"])
-    if not planning:
-        return
-
-    with st.expander("2. Import CSV + Mapping", expanded=st.session_state["wizard_active_section"] == 2):
         uploaded_file = st.file_uploader(
             "Charger un fichier CSV",
             type=["csv"],
-            key=f"csv_upload_{planning.id}"
+            key="csv_upload_wizard",
         )
 
         local_df = None
 
         if uploaded_file is not None:
             try:
-                planning.csv_filename = uploaded_file.name
-                planning.csv_bytes = uploaded_file.getvalue()
-                planning.updated_at = datetime.now(timezone.utc)
-                session.commit()
-                local_df = _read_csv_safely(planning.csv_bytes)
+                csv_bytes = uploaded_file.getvalue()
+                st.session_state["wizard_csv_bytes"]    = csv_bytes
+                st.session_state["wizard_csv_filename"] = uploaded_file.name
+                local_df = _read_csv_safely(csv_bytes)
+                # Also persist to planning if it already exists
+                if planning:
+                    planning.csv_filename = uploaded_file.name
+                    planning.csv_bytes    = csv_bytes
+                    planning.updated_at   = datetime.now(timezone.utc)
+                    session.commit()
             except Exception as e:
-                session.rollback()
+                if planning:
+                    session.rollback()
                 st.error(f"Erreur lors du chargement du CSV : {e}")
 
-        elif planning.csv_bytes:
+        elif existing_csv_bytes:
             try:
-                local_df = _read_csv_safely(planning.csv_bytes)
+                local_df = _read_csv_safely(existing_csv_bytes)
             except Exception as e:
                 st.error(f"Erreur de lecture du CSV enregistré : {e}")
 
@@ -1850,13 +2167,14 @@ def render_scheduling_module(session, user):
             with st.form("mapping_form"):
                 mapping = {}
                 options = [""] + columns
-
-                for key, label in targets:
-                    default_val = current_mapping.get(key, "")
-                    default_index = options.index(default_val) if default_val in options else 0
-                    mapping[key] = st.selectbox(label, options, index=default_index, key=f"map_{key}")
-
-                submitted_mapping = st.form_submit_button("Valider le mapping", use_container_width=True)
+                col_a, col_b = st.columns(2)
+                for idx, (key, label) in enumerate(targets):
+                    col = col_a if idx % 2 == 0 else col_b
+                    with col:
+                        default_val = current_mapping.get(key, "")
+                        default_index = options.index(default_val) if default_val in options else 0
+                        mapping[key] = st.selectbox(label, options, index=default_index, key=f"map_{key}")
+                submitted_mapping = st.form_submit_button("Valider le mapping", use_container_width=True, type="primary")
 
             if submitted_mapping:
                 if not mapping["ot_id"] or not mapping["description"] or not mapping["atelier"]:
@@ -1865,7 +2183,110 @@ def render_scheduling_module(session, user):
                     st.session_state["wizard_mapping"] = mapping
                     _save_mapping(session, user.organization_id, mapping)
                     st.session_state["wizard_tasks_df"] = _build_tasks_df_from_mapping(local_df, mapping)
-                    st.session_state["wizard_active_section"] = 3
+                    st.session_state["wizard_active_section"] = 2
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # FIX #1 — ÉTAPE 2 : Paramètres de l'arrêt (crée le planning en DB)
+    # ─────────────────────────────────────────────────────────────────────────
+    default_name        = planning.name if planning else ""
+    default_sectors     = planning.sectors_csv if planning else ""
+    default_start_date  = planning.start_at.date() if planning else datetime.now().date()
+    default_end_date    = planning.end_at.date() if planning else datetime.now().date()
+    default_daily_open  = planning.daily_open if planning else "07:00"
+    default_daily_close = planning.daily_close if planning else "15:00"
+    default_site_open   = getattr(planning, "site_open",  None) or "06:00" if planning else "06:00"
+    default_site_close  = getattr(planning, "site_close", None) or "22:00" if planning else "22:00"
+
+    with st.expander("2. Paramètres de l'arrêt", expanded=st.session_state["wizard_active_section"] == 2):
+        with st.form("create_planning_form"):
+            name = st.text_input("Nom du planning", value=default_name)
+            sectors_txt = st.text_input("Secteurs (séparés par des virgules)", value=default_sectors)
+
+            col1, col2 = st.columns(2)
+            with col1:
+                start_date = st.date_input("Date de début de l'arrêt", value=default_start_date)
+                daily_open = st.text_input(
+                    "🔧 Heure de début fenêtre d'arrêt (HH:MM)",
+                    value=default_daily_open,
+                    help="Heure de début des travaux (ex : 07:00)",
+                )
+            with col2:
+                end_date = st.date_input("Date de fin de l'arrêt", value=default_end_date)
+                daily_close = st.text_input(
+                    "🔧 Heure de fin fenêtre d'arrêt (HH:MM)",
+                    value=default_daily_close,
+                    help="Heure de fin des travaux (ex : 15:00)",
+                )
+
+            st.markdown("**Plage horaire du site (multi-jours)**")
+            st.caption("Bornes autorisées pour planifier chaque jour. La fenêtre d'arrêt doit être à l'intérieur de ces bornes.")
+            scol1, scol2 = st.columns(2)
+            with scol1:
+                site_open = st.text_input(
+                    "🏭 Heure d'ouverture du site (HH:MM)",
+                    value=default_site_open,
+                    help="Ex : 06:00",
+                )
+            with scol2:
+                site_close = st.text_input(
+                    "🏭 Heure de fermeture du site (HH:MM)",
+                    value=default_site_close,
+                    help="Ex : 22:00",
+                )
+
+            submitted = st.form_submit_button("Valider les paramètres", use_container_width=True, type="primary")
+
+        if submitted:
+            try:
+                start_at = _combine_date_time(start_date, daily_open)
+                end_at   = _combine_date_time(end_date, daily_close)
+                csv_bytes_to_save    = st.session_state.get("wizard_csv_bytes")
+                csv_filename_to_save = st.session_state.get("wizard_csv_filename")
+
+                if planning:
+                    planning.name        = name.strip()
+                    planning.sectors_csv = sectors_txt.strip()
+                    planning.start_at    = start_at
+                    planning.end_at      = end_at
+                    planning.daily_open  = daily_open
+                    planning.daily_close = daily_close
+                    planning.site_open   = site_open
+                    planning.site_close  = site_close
+                    planning.updated_at  = datetime.now(timezone.utc)
+                    if csv_bytes_to_save and not planning.csv_bytes:
+                        planning.csv_bytes    = csv_bytes_to_save
+                        planning.csv_filename = csv_filename_to_save
+                    session.commit()
+                else:
+                    planning = Planning(
+                        organization_id   = user.organization_id,
+                        created_by_user_id= user.id,
+                        name              = name.strip(),
+                        sectors_csv       = sectors_txt.strip(),
+                        start_at          = start_at,
+                        end_at            = end_at,
+                        daily_open        = daily_open,
+                        daily_close       = daily_close,
+                        site_open         = site_open,
+                        site_close        = site_close,
+                        status            = "draft",
+                        csv_bytes         = csv_bytes_to_save,
+                        csv_filename      = csv_filename_to_save,
+                    )
+                    session.add(planning)
+                    session.commit()
+                    session.refresh(planning)
+                    st.session_state["wizard_planning_id"] = planning.id
+
+                st.session_state["wizard_active_section"] = 3
+
+            except Exception as e:
+                session.rollback()
+                st.error(f"Erreur lors de l'enregistrement des paramètres : {e}")
+
+    planning = _get_current_planning(session, st.session_state["wizard_planning_id"])
+    if not planning:
+        return
 
     with st.expander("3. Sélection ateliers / secteurs", expanded=st.session_state["wizard_active_section"] == 3):
         tasks_df = st.session_state.get("wizard_tasks_df")
@@ -2282,14 +2703,21 @@ def render_scheduling_module(session, user):
             if generated_df is not None and not generated_df.empty:
                 st.subheader("Planning généré")
 
+                # FIX #5: Add explicit date column extracted from planned_start_at
+                display_df = generated_df.copy()
+                if "planned_start_at" in display_df.columns:
+                    display_df["date"] = pd.to_datetime(
+                        display_df["planned_start_at"], errors="coerce"
+                    ).dt.strftime("%d/%m/%Y").fillna("")
+
                 display_cols = [c for c in [
-                    "ot_id", "description", "atelier",
+                    "date", "ot_id", "description", "atelier",
                     "duration_hours", "planned_start_at", "planned_end_at",
                     "planned_team_name", "commentaire",
-                ] if c in generated_df.columns]
+                ] if c in display_df.columns]
 
                 st.dataframe(
-                    generated_df[display_cols],
+                    display_df[display_cols],
                     use_container_width=True,
                     hide_index=True,
                 )
