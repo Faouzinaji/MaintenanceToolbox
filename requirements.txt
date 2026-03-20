@@ -5,3 +5,4 @@ werkzeug
 pandas
 matplotlib
 fpdf2
+plotly

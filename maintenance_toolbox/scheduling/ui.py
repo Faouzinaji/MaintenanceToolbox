@@ -9,6 +9,13 @@ import pandas as pd
 import streamlit as st
 from sqlalchemy import select
 
+try:
+    import plotly.express as px
+    import plotly.graph_objects as go
+    _PLOTLY_AVAILABLE = True
+except ImportError:
+    _PLOTLY_AVAILABLE = False
+
 from maintenance_toolbox.db import (
     Planning,
     PlanningTask,
@@ -529,6 +536,16 @@ def _prepare_manual_actions_df(actions_df):
         return pd.DataFrame(columns=["task_id", "ot_id", "description", "equipment_desc", "equipment", "atelier", "duration_h", "predecessor_ot", "forced_start_dt", "forced_teams_list", "priority_score", "status", "slot_type"])
 
     df = actions_df.copy()
+
+    # BUG FIX #5: Drop rows that are completely empty (no description, no atelier, no duration)
+    df = df[
+        (df.get("description", pd.Series([""] * len(df))).astype(str).str.strip() != "") |
+        (df.get("atelier", pd.Series([""] * len(df))).astype(str).str.strip() != "")
+    ].copy()
+
+    if df.empty:
+        return pd.DataFrame(columns=["task_id", "ot_id", "description", "equipment_desc", "equipment", "atelier", "duration_h", "predecessor_ot", "forced_start_dt", "forced_teams_list", "priority_score", "status", "slot_type"])
+
     df["action_id"] = df["action_id"].replace("", pd.NA)
     if len(df) > 0:
         fallback_ids = [f"ACT_{i+1}" for i in range(len(df))]
@@ -543,6 +560,16 @@ def _prepare_manual_actions_df(actions_df):
     df["duration_h"] = pd.to_numeric(df["duration_hours"], errors="coerce").fillna(0.0)
     df["priority_score"] = 999
     df["status"] = "manual"
+
+    # BUG FIX #5: slot_type must default to "DURING" to avoid being filtered out
+    if "slot_type" not in df.columns:
+        df["slot_type"] = "DURING"
+    else:
+        df["slot_type"] = df["slot_type"].fillna("DURING").replace("", "DURING")
+
+    print(f"[DEBUG manual actions] {len(df)} action(s) préparée(s) pour le planning:")
+    for _, r in df.iterrows():
+        print(f"  → {r['task_id']} | atelier={r['atelier']} | durée={r['duration_h']}h | slot={r['slot_type']}")
 
     return df[
         [
@@ -1123,26 +1150,139 @@ def _render_rex_panel(session, user, planning_id):
 # GANTT + PDF HELPERS
 # =========================================================
 
-def _render_gantt(generated_df: "pd.DataFrame", planning) -> None:
-    """Render a horizontal Gantt chart using matplotlib broken_barh."""
+_GANTT_COLORS = [
+    "#4B7BE5", "#E55C5C", "#5CB85C", "#9B59B6",
+    "#3CBFCF", "#2ECC71", "#E91E8C", "#FF6B35",
+]
+_MN_ORANGE = "#F5A623"
+
+
+def _render_gantt(generated_df: "pd.DataFrame", planning, manual_df=None) -> None:
+    """Render an interactive Gantt chart using Plotly timeline."""
+    try:
+        df = generated_df.copy()
+        df["_start"] = pd.to_datetime(df["planned_start_at"], errors="coerce")
+        df["_end"] = pd.to_datetime(df["planned_end_at"], errors="coerce")
+        df = df.dropna(subset=["_start", "_end"])
+        df["is_manual"] = False
+        df["_type"] = df["atelier"].astype(str)
+        df["_label"] = df["ot_id"].astype(str)
+        df["_desc"] = df.get("description", "").astype(str).apply(lambda x: x[:60])
+        df["_team"] = df.get("planned_team_name", "").astype(str)
+        df["_dur"] = df.get("duration_hours", 0).apply(lambda x: f"{round(float(x or 0), 1)} h")
+
+        # Merge manual actions with distinct colour
+        if manual_df is not None and not manual_df.empty:
+            mdf = manual_df.copy()
+            mdf["_start"] = pd.to_datetime(mdf["planned_start_at"], errors="coerce")
+            mdf["_end"] = pd.to_datetime(mdf["planned_end_at"], errors="coerce")
+            mdf = mdf.dropna(subset=["_start", "_end"])
+            if not mdf.empty:
+                mdf["is_manual"] = True
+                mdf["atelier"] = mdf.get("atelier", mdf.get("task_id", "Manuel")).astype(str)
+                mdf["_type"] = "Action manuelle"
+                mdf["_label"] = mdf.get("ot_id", mdf.get("task_id", "")).astype(str)
+                mdf["_desc"] = mdf.get("description", "").astype(str).apply(lambda x: x[:60])
+                mdf["_team"] = mdf.get("planned_team_name", "").astype(str)
+                mdf["_dur"] = mdf.get("duration_h", mdf.get("duration_hours", 0)).apply(lambda x: f"{round(float(x or 0), 1)} h")
+                common_cols = ["atelier", "_start", "_end", "_type", "_label", "_desc", "_team", "_dur", "is_manual"]
+                df = pd.concat([df[common_cols], mdf[common_cols]], ignore_index=True)
+
+        if df.empty:
+            st.info("Données insuffisantes pour le Gantt (pas de dates planifiées).")
+            return
+
+        if not _PLOTLY_AVAILABLE:
+            # Fallback to matplotlib
+            _render_gantt_matplotlib(df, planning)
+            return
+
+        # Build colour map
+        types = df["_type"].unique().tolist()
+        color_map = {}
+        palette_idx = 0
+        for t in types:
+            if t == "Action manuelle":
+                color_map[t] = _MN_ORANGE
+            else:
+                color_map[t] = _GANTT_COLORS[palette_idx % len(_GANTT_COLORS)]
+                palette_idx += 1
+
+        fig = px.timeline(
+            df,
+            x_start="_start",
+            x_end="_end",
+            y="atelier",
+            color="_type",
+            text="_label",
+            hover_data={
+                "_label": True,
+                "_desc": True,
+                "_start": True,
+                "_end": True,
+                "_dur": True,
+                "_team": True,
+                "_type": False,
+                "atelier": False,
+            },
+            labels={
+                "_label": "N° OT",
+                "_desc": "Description",
+                "_start": "Début",
+                "_end": "Fin",
+                "_dur": "Durée",
+                "_team": "Équipe",
+            },
+            color_discrete_map=color_map,
+        )
+
+        fig.update_yaxes(autorange="reversed", title="Atelier / Équipe")
+        fig.update_xaxes(
+            title="Horaire",
+            showgrid=True,
+            gridwidth=1,
+            gridcolor="#E0E0E0",
+            tickformat="%d/%m\n%H:%M",
+        )
+        fig.update_traces(
+            textposition="inside",
+            insidetextanchor="middle",
+            textfont=dict(size=11, color="white", family="Arial Black"),
+        )
+        fig.update_layout(
+            title=dict(text=f"Gantt — {planning.name}", font=dict(size=16, color="#6B6B6B")),
+            plot_bgcolor="#FFFFFF",
+            paper_bgcolor="#F2F2F2",
+            legend=dict(
+                orientation="h",
+                yanchor="top",
+                y=-0.15,
+                xanchor="left",
+                x=0,
+                title="Équipes / Types",
+            ),
+            hovermode="closest",
+            margin=dict(l=20, r=20, t=50, b=80),
+        )
+
+        st.plotly_chart(fig, use_container_width=True)
+
+    except Exception as e:
+        st.warning(f"Gantt non affiché : {e}")
+        import traceback
+        st.caption(traceback.format_exc())
+
+
+def _render_gantt_matplotlib(df, planning):
+    """Fallback Gantt renderer using matplotlib (used when Plotly is not available)."""
     try:
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
         import matplotlib.dates as mdates
 
-        df = generated_df.copy()
-        df["_start"] = pd.to_datetime(df["planned_start_at"], errors="coerce")
-        df["_end"] = pd.to_datetime(df["planned_end_at"], errors="coerce")
-        df = df.dropna(subset=["_start", "_end"])
-
-        if df.empty:
-            st.info("Données insuffisantes pour le Gantt (pas de dates planifiées).")
-            return
-
         ateliers = df["atelier"].unique().tolist()
-        cmap = plt.get_cmap("Set3")
-        colors = {a: cmap(i / max(len(ateliers), 1)) for i, a in enumerate(ateliers)}
+        colors = {a: _GANTT_COLORS[i % len(_GANTT_COLORS)] for i, a in enumerate(ateliers)}
 
         fig_h = max(3.5, len(ateliers) * 0.9 + 2)
         fig, ax = plt.subplots(figsize=(14, fig_h))
@@ -1153,69 +1293,88 @@ def _render_gantt(generated_df: "pd.DataFrame", planning) -> None:
                 t0 = mdates.date2num(row["_start"].to_pydatetime())
                 t1 = mdates.date2num(row["_end"].to_pydatetime())
                 dur = max(t1 - t0, 1e-4)
-                ax.broken_barh(
-                    [(t0, dur)], (i - 0.38, 0.76),
-                    facecolors=colors[atelier], edgecolors="#ffffff", linewidth=0.8,
-                )
-                label = str(row.get("ot_id", ""))[:10]
-                ax.text(
-                    t0 + dur / 2, i, label,
-                    ha="center", va="center", fontsize=6.5, color="#2c2c2c", fontweight="bold",
-                )
+                fc = _MN_ORANGE if row.get("is_manual") else colors[atelier]
+                ax.broken_barh([(t0, dur)], (i - 0.38, 0.76), facecolors=fc, edgecolors="#fff", linewidth=0.8)
+                ax.text(t0 + dur / 2, i, str(row.get("_label", ""))[:10],
+                        ha="center", va="center", fontsize=6.5, color="#fff", fontweight="bold")
 
         ax.set_yticks(range(len(ateliers)))
         ax.set_yticklabels(ateliers, fontsize=9)
         ax.xaxis_date()
         ax.xaxis.set_major_formatter(mdates.DateFormatter("%d/%m\n%H:%M"))
         ax.xaxis.set_major_locator(mdates.AutoDateLocator())
-        ax.set_xlabel("Horaire", fontsize=9)
-        ax.set_title(f"Gantt — {planning.name}", fontsize=11, fontweight="bold")
         ax.grid(True, axis="x", alpha=0.25, linestyle="--")
-        ax.spines["top"].set_visible(False)
-        ax.spines["right"].set_visible(False)
+        ax.set_title(f"Gantt — {planning.name}", fontsize=11, fontweight="bold")
         plt.tight_layout()
         st.pyplot(fig, use_container_width=True)
         plt.close(fig)
-
-    except ImportError:
-        st.info("matplotlib non disponible pour le Gantt.")
     except Exception as e:
-        st.warning(f"Gantt non affiché : {e}")
+        st.warning(f"Gantt matplotlib non affiché : {e}")
+
+
+def _safe_pdf_str(val, max_len=50):
+    """Encode a value for PDF — strips non-latin1 chars to avoid fpdf2 encoding errors."""
+    s = "" if val is None or (isinstance(val, float) and pd.isna(val)) else str(val)
+    s = s[:max_len]
+    return s.encode("latin-1", errors="replace").decode("latin-1")
 
 
 def _generate_planning_pdf(generated_df: "pd.DataFrame", planning) -> bytes:
-    """Generate a PDF summary of the planning using fpdf2."""
-    from fpdf import FPDF
+    """Generate a PDF summary of the planning using fpdf2.
+
+    BUG FIX #7: The previous version could silently fail when fpdf2 received
+    non-latin1 characters (accented text from descriptions). Fixed via _safe_pdf_str().
+    Also ensured pdf.output() always returns bytes (not bytearray).
+    """
+    try:
+        from fpdf import FPDF
+    except ImportError:
+        raise RuntimeError("fpdf2 n'est pas installé. Exécutez : pip install fpdf2")
 
     pdf = FPDF(orientation="L", format="A4")
     pdf.set_auto_page_break(auto=True, margin=12)
     pdf.add_page()
 
+    plan_name = _safe_pdf_str(planning.name, 80)
+    start_str = _safe_pdf_str(str(planning.start_at)[:19])
+    end_str = _safe_pdf_str(str(planning.end_at)[:19])
+    sectors = _safe_pdf_str(getattr(planning, "sectors_csv", "") or "")
+
     # ── Header ──────────────────────────────────────────────────────────────
+    pdf.set_fill_color(245, 166, 35)  # Mainnovation orange
+    pdf.set_text_color(255, 255, 255)
     pdf.set_font("Helvetica", "B", 14)
-    pdf.cell(0, 10, f"Planning : {planning.name}", new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(0, 12, f"Planning : {plan_name}", new_x="LMARGIN", new_y="NEXT", fill=True, align="L")
+
+    pdf.set_fill_color(242, 242, 242)
+    pdf.set_text_color(107, 107, 107)
     pdf.set_font("Helvetica", "", 9)
-    pdf.cell(0, 6, f"Periode : {planning.start_at}  →  {planning.end_at}", new_x="LMARGIN", new_y="NEXT")
-    pdf.cell(0, 6, f"Statut : {planning.status}", new_x="LMARGIN", new_y="NEXT")
-    pdf.ln(3)
+    pdf.cell(0, 6, f"Periode : {start_str}  ->  {end_str}", new_x="LMARGIN", new_y="NEXT", fill=True)
+    if sectors:
+        pdf.cell(0, 6, f"Secteurs : {sectors}", new_x="LMARGIN", new_y="NEXT", fill=True)
+    pdf.cell(0, 6, f"Statut : {_safe_pdf_str(planning.status)}", new_x="LMARGIN", new_y="NEXT", fill=True)
+    pdf.ln(4)
 
     # ── Summary metrics ─────────────────────────────────────────────────────
     df = generated_df.copy()
     n_ot = len(df)
     total_h = round(float(df["duration_hours"].sum()) if "duration_hours" in df.columns else 0, 1)
-    ateliers = df["atelier"].unique().tolist() if "atelier" in df.columns else []
+    ateliers = df["atelier"].dropna().astype(str).unique().tolist() if "atelier" in df.columns else []
+    ateliers_str = _safe_pdf_str(", ".join(ateliers[:8]), 100)
 
+    pdf.set_fill_color(245, 166, 35)
+    pdf.set_text_color(255, 255, 255)
     pdf.set_font("Helvetica", "B", 9)
-    pdf.cell(60, 7, f"OT planifiés : {n_ot}", border=1, align="C")
-    pdf.cell(60, 7, f"Charge totale : {total_h} h", border=1, align="C")
-    pdf.cell(80, 7, f"Ateliers : {', '.join(ateliers[:6])}", border=1, align="C")
-    pdf.ln(10)
+    pdf.cell(60, 8, f"OT planifies : {n_ot}", border=0, align="C", fill=True)
+    pdf.cell(60, 8, f"Charge totale : {total_h} h", border=0, align="C", fill=True)
+    pdf.cell(0, 8, f"Ateliers : {ateliers_str}", border=0, align="L", fill=True)
+    pdf.ln(12)
 
     # ── Table header ─────────────────────────────────────────────────────────
-    col_w = [22, 68, 28, 18, 38, 38, 34]
-    headers = ["N° OT", "Description", "Atelier", "Durée (h)", "Début", "Fin", "Equipe"]
+    col_w = [22, 72, 28, 16, 38, 38, 34]
+    headers = ["N OT", "Description", "Atelier", "Duree (h)", "Debut", "Fin", "Equipe"]
 
-    pdf.set_fill_color(243, 146, 0)  # --mn-orange
+    pdf.set_fill_color(107, 107, 107)
     pdf.set_text_color(255, 255, 255)
     pdf.set_font("Helvetica", "B", 8)
     for h, w in zip(headers, col_w):
@@ -1227,15 +1386,23 @@ def _generate_planning_pdf(generated_df: "pd.DataFrame", planning) -> bytes:
     pdf.set_font("Helvetica", "", 7)
     fill = False
     for _, row in df.iterrows():
-        pdf.set_fill_color(255, 248, 235) if fill else pdf.set_fill_color(255, 255, 255)
+        if fill:
+            pdf.set_fill_color(253, 232, 192)  # soft orange
+        else:
+            pdf.set_fill_color(255, 255, 255)
+        dur_val = row.get("duration_hours", 0) or 0
+        try:
+            dur_str = str(round(float(dur_val), 1))
+        except Exception:
+            dur_str = "0"
         cells = [
-            str(row.get("ot_id", ""))[:14],
-            str(row.get("description", ""))[:48],
-            str(row.get("atelier", ""))[:18],
-            str(round(float(row.get("duration_hours", 0) or 0), 1)),
-            str(row.get("planned_start_at", ""))[:16],
-            str(row.get("planned_end_at", ""))[:16],
-            str(row.get("planned_team_name", ""))[:18],
+            _safe_pdf_str(row.get("ot_id", ""), 14),
+            _safe_pdf_str(row.get("description", ""), 50),
+            _safe_pdf_str(row.get("atelier", ""), 18),
+            dur_str,
+            _safe_pdf_str(str(row.get("planned_start_at", ""))[:16]),
+            _safe_pdf_str(str(row.get("planned_end_at", ""))[:16]),
+            _safe_pdf_str(row.get("planned_team_name", ""), 20),
         ]
         for val, w in zip(cells, col_w):
             pdf.cell(w, 6, val, border=1, fill=True)
@@ -1246,9 +1413,134 @@ def _generate_planning_pdf(generated_df: "pd.DataFrame", planning) -> bytes:
     pdf.ln(4)
     pdf.set_font("Helvetica", "I", 7)
     pdf.set_text_color(150, 150, 150)
-    pdf.cell(0, 5, "Généré par MaintenOps", align="C")
+    pdf.cell(0, 5, "Genere par MaintenOps — Mainnovation", align="C")
 
-    return bytes(pdf.output())
+    raw = pdf.output()
+    return bytes(raw) if not isinstance(raw, bytes) else raw
+
+
+def _generate_planning_html(generated_df: "pd.DataFrame", planning, manual_df=None) -> bytes:
+    """Generate a standalone HTML planning export with Mainnovation styling.
+
+    Returns UTF-8 encoded bytes ready for st.download_button.
+    """
+    df = generated_df.copy()
+
+    plan_name = str(planning.name or "")
+    start_str = str(planning.start_at)[:19] if planning.start_at else ""
+    end_str = str(planning.end_at)[:19] if planning.end_at else ""
+    sectors = str(getattr(planning, "sectors_csv", "") or "")
+
+    n_ot = len(df)
+    total_h = round(float(df["duration_hours"].sum()) if "duration_hours" in df.columns else 0, 1)
+    ateliers = df["atelier"].dropna().astype(str).unique().tolist() if "atelier" in df.columns else []
+
+    # Build rows
+    display_cols = ["ot_id", "description", "atelier", "duration_hours", "planned_start_at", "planned_end_at", "planned_team_name"]
+    display_cols = [c for c in display_cols if c in df.columns]
+    col_labels = {
+        "ot_id": "N° OT", "description": "Description", "atelier": "Atelier",
+        "duration_hours": "Durée (h)", "planned_start_at": "Début",
+        "planned_end_at": "Fin", "planned_team_name": "Équipe",
+    }
+
+    thead = "".join(f"<th>{col_labels.get(c, c)}</th>" for c in display_cols)
+    tbody_rows = []
+    for i, (_, row) in enumerate(df[display_cols].iterrows()):
+        bg = "#fde8c0" if i % 2 == 0 else "#ffffff"
+        cells = ""
+        for c in display_cols:
+            val = row.get(c, "")
+            if c == "duration_hours":
+                try:
+                    val = round(float(val or 0), 1)
+                except Exception:
+                    val = 0
+            cells += f"<td>{val}</td>"
+        tbody_rows.append(f'<tr style="background:{bg}">{cells}</tr>')
+    tbody = "\n".join(tbody_rows)
+
+    # Manual actions section
+    manual_section = ""
+    if manual_df is not None and not manual_df.empty:
+        mrows = []
+        for i, (_, row) in enumerate(manual_df.iterrows()):
+            bg = "#fff3e0" if i % 2 == 0 else "#ffffff"
+            ot = row.get("ot_id", row.get("task_id", ""))
+            desc = row.get("description", "")
+            at = row.get("atelier", "")
+            dur = row.get("duration_h", row.get("duration_hours", 0))
+            try:
+                dur = round(float(dur or 0), 1)
+            except Exception:
+                dur = 0
+            ps = str(row.get("planned_start_at", ""))[:16]
+            pe = str(row.get("planned_end_at", ""))[:16]
+            team = row.get("planned_team_name", "")
+            mrows.append(f'<tr style="background:{bg}"><td>{ot}</td><td>{desc}</td><td>{at}</td><td>{dur}</td><td>{ps}</td><td>{pe}</td><td>{team}</td></tr>')
+        manual_section = f"""
+        <h2 style="color:#F5A623;margin-top:32px">Actions manuelles planifiées</h2>
+        <table>
+          <thead><tr><th>ID Action</th><th>Description</th><th>Atelier</th><th>Durée (h)</th><th>Début</th><th>Fin</th><th>Équipe</th></tr></thead>
+          <tbody>{"".join(mrows)}</tbody>
+        </table>
+        """
+
+    html = f"""<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Planning — {plan_name}</title>
+  <style>
+    * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+    body {{ font-family: Arial, sans-serif; color: #6B6B6B; background: #F2F2F2; padding: 24px; }}
+    .header {{ background: #F5A623; color: white; padding: 20px 28px; border-radius: 10px; margin-bottom: 24px; }}
+    .header h1 {{ font-size: 1.6rem; margin-bottom: 6px; }}
+    .header p {{ font-size: 0.95rem; opacity: 0.9; margin: 2px 0; }}
+    .kpis {{ display: flex; gap: 16px; margin-bottom: 24px; }}
+    .kpi {{ background: white; border-left: 4px solid #F5A623; padding: 14px 20px; border-radius: 8px; flex: 1; }}
+    .kpi .val {{ font-size: 1.8rem; font-weight: 700; color: #F5A623; }}
+    .kpi .lbl {{ font-size: 0.85rem; color: #6B6B6B; margin-top: 4px; }}
+    h2 {{ font-size: 1.1rem; color: #6B6B6B; margin-bottom: 12px; }}
+    table {{ width: 100%; border-collapse: collapse; background: white; border-radius: 8px; overflow: hidden; box-shadow: 0 1px 4px rgba(0,0,0,0.08); }}
+    thead tr {{ background: #6B6B6B; }}
+    th {{ color: white; padding: 10px 12px; text-align: left; font-size: 0.85rem; font-weight: 700; }}
+    td {{ padding: 8px 12px; font-size: 0.85rem; border-bottom: 1px solid #f0f0f0; }}
+    .footer {{ text-align: center; margin-top: 32px; font-size: 0.75rem; color: #aaa; }}
+    @media print {{
+      body {{ padding: 10px; }}
+      .kpis {{ flex-wrap: wrap; }}
+    }}
+  </style>
+</head>
+<body>
+  <div class="header">
+    <h1>Planning : {plan_name}</h1>
+    <p>Période : {start_str} → {end_str}</p>
+    {"<p>Secteurs : " + sectors + "</p>" if sectors else ""}
+    <p>Statut : {planning.status}</p>
+  </div>
+
+  <div class="kpis">
+    <div class="kpi"><div class="val">{n_ot}</div><div class="lbl">OT planifiés</div></div>
+    <div class="kpi"><div class="val">{total_h} h</div><div class="lbl">Charge totale</div></div>
+    <div class="kpi"><div class="val">{len(ateliers)}</div><div class="lbl">Ateliers</div></div>
+  </div>
+
+  <h2>Planning détaillé des OT</h2>
+  <table>
+    <thead><tr>{thead}</tr></thead>
+    <tbody>{tbody}</tbody>
+  </table>
+
+  {manual_section}
+
+  <div class="footer">Généré par MaintenOps — Mainnovation &nbsp;|&nbsp; {datetime.now().strftime("%d/%m/%Y %H:%M")}</div>
+</body>
+</html>"""
+
+    return html.encode("utf-8")
 
 
 # =========================================================
@@ -1421,6 +1713,8 @@ def render_scheduling_module(session, user):
     default_end_date = planning.end_at.date() if planning else datetime.now().date()
     default_daily_open = planning.daily_open if planning else "07:00"
     default_daily_close = planning.daily_close if planning else "15:00"
+    default_site_open = getattr(planning, "site_open", None) or "06:00" if planning else "06:00"
+    default_site_close = getattr(planning, "site_close", None) or "22:00" if planning else "22:00"
 
     with st.expander("1. Paramètres de l'arrêt", expanded=st.session_state["wizard_active_section"] == 1):
         with st.form("create_planning_form"):
@@ -1429,13 +1723,37 @@ def render_scheduling_module(session, user):
 
             col1, col2 = st.columns(2)
             with col1:
-                start_date = st.date_input("Date de début", value=default_start_date)
-                daily_open = st.text_input("Heure d'ouverture", value=default_daily_open)
+                start_date = st.date_input("Date de début de l'arrêt", value=default_start_date)
+                daily_open = st.text_input(
+                    "🔧 Heure de début de la fenêtre d'arrêt (HH:MM)",
+                    value=default_daily_open,
+                    help="Heure de début des travaux dans la fenêtre d'arrêt (ex : 07:00)",
+                )
             with col2:
-                end_date = st.date_input("Date de fin", value=default_end_date)
-                daily_close = st.text_input("Heure de fermeture", value=default_daily_close)
+                end_date = st.date_input("Date de fin de l'arrêt", value=default_end_date)
+                daily_close = st.text_input(
+                    "🔧 Heure de fin de la fenêtre d'arrêt (HH:MM)",
+                    value=default_daily_close,
+                    help="Heure de fin des travaux dans la fenêtre d'arrêt (ex : 15:00)",
+                )
 
-            submitted = st.form_submit_button("Valider les paramètres", use_container_width=True)
+            st.markdown("**Plage horaire du site (multi-jours)**")
+            st.caption("Ces heures définissent la plage autorisée pour planifier des OT sur plusieurs jours. La fenêtre d'arrêt doit être à l'intérieur de ces bornes.")
+            scol1, scol2 = st.columns(2)
+            with scol1:
+                site_open = st.text_input(
+                    "🏭 Heure d'ouverture du site (HH:MM)",
+                    value=default_site_open,
+                    help="Heure à partir de laquelle le site est opérationnel chaque jour (ex : 06:00)",
+                )
+            with scol2:
+                site_close = st.text_input(
+                    "🏭 Heure de fermeture du site (HH:MM)",
+                    value=default_site_close,
+                    help="Heure après laquelle le site ferme chaque jour (ex : 22:00)",
+                )
+
+            submitted = st.form_submit_button("Valider les paramètres", use_container_width=True, type="primary")
 
         if submitted:
             try:
@@ -1449,6 +1767,8 @@ def render_scheduling_module(session, user):
                     planning.end_at = end_at
                     planning.daily_open = daily_open
                     planning.daily_close = daily_close
+                    planning.site_open = site_open
+                    planning.site_close = site_close
                     planning.updated_at = datetime.now(timezone.utc)
                     session.commit()
                 else:
@@ -1461,6 +1781,8 @@ def render_scheduling_module(session, user):
                         end_at=end_at,
                         daily_open=daily_open,
                         daily_close=daily_close,
+                        site_open=site_open,
+                        site_close=site_close,
                         status="draft",
                     )
                     session.add(planning)
@@ -1663,11 +1985,25 @@ def render_scheduling_module(session, user):
                 expanded = idx == st.session_state.get("wizard_current_atelier_idx", 0)
                 with st.expander(f"{atelier} — charge sélectionnée : {round(selected_hours,1)} h", expanded=expanded):
                     with st.form(f"atelier_main_form_{_safe_key(atelier)}"):
-                        display_df = work_df[
-                            ["selected", "ot_id", "description", "equipment_desc", "status", "duration_hours"]
-                        ].copy()
-                        display_df["description"] = display_df["description"].apply(lambda x: _shorten(x, 42))
-                        display_df["equipment_desc"] = display_df["equipment_desc"].apply(lambda x: _shorten(x, 30))
+                        # #3 AMÉLIORATION: ajout colonne "Code équipement"
+                        available_cols = ["selected", "ot_id", "description", "equipment", "equipment_desc", "status", "duration_hours"]
+                        display_cols_ot = [c for c in available_cols if c in work_df.columns]
+                        display_df = work_df[display_cols_ot].copy()
+                        display_df["description"] = display_df["description"].apply(lambda x: _shorten(x, 40))
+                        if "equipment_desc" in display_df.columns:
+                            display_df["equipment_desc"] = display_df["equipment_desc"].apply(lambda x: _shorten(x, 28))
+                        if "equipment" in display_df.columns:
+                            display_df["equipment"] = display_df["equipment"].apply(lambda x: _shorten(x, 20))
+
+                        col_cfg_ot = {
+                            "selected": st.column_config.CheckboxColumn("✓"),
+                            "ot_id": st.column_config.TextColumn("N° OT", disabled=True),
+                            "description": st.column_config.TextColumn("Description", disabled=True),
+                            "equipment": st.column_config.TextColumn("Code équipement", disabled=True),
+                            "equipment_desc": st.column_config.TextColumn("Desc. équipement", disabled=True),
+                            "status": st.column_config.TextColumn("Statut", disabled=True),
+                            "duration_hours": st.column_config.NumberColumn("Durée retenue (h)", min_value=0.0, step=0.5),
+                        }
 
                         edited_main = st.data_editor(
                             display_df,
@@ -1675,14 +2011,7 @@ def render_scheduling_module(session, user):
                             hide_index=True,
                             num_rows="fixed",
                             key=f"main_editor_{_safe_key(atelier)}",
-                            column_config={
-                                "selected": st.column_config.CheckboxColumn(""),
-                                "ot_id": st.column_config.TextColumn("OT", disabled=True),
-                                "description": st.column_config.TextColumn("Description", disabled=True),
-                                "equipment_desc": st.column_config.TextColumn("Equipement", disabled=True),
-                                "status": st.column_config.TextColumn("Statut", disabled=True),
-                                "duration_hours": st.column_config.NumberColumn("Durée retenue (h)", min_value=0.0, step=0.5),
-                            },
+                            column_config=col_cfg_ot,
                         )
 
                         validate_selection = st.form_submit_button("Valider la sélection", use_container_width=True)
@@ -1733,8 +2062,11 @@ def render_scheduling_module(session, user):
 
                             for _, r in selected_rows.iterrows():
                                 ot_id = str(r["ot_id"])
+                                # #2 AMÉLIORATION: affichage N°OT | durée | description AVANT dépliage
+                                h_sel = round(float(r.get("duration_hours", 0) or 0), 1)
+                                expander_label = f"**{ot_id}** | {h_sel} h | {_shorten(r['description'], 60)}"
 
-                                with st.expander(f"{ot_id} — {_shorten(r['description'], 70)}", expanded=False):
+                                with st.expander(expander_label, expanded=False):
                                     pred_options = [""] + [x for x in pred_labels.keys() if x != ot_id]
                                     current_pred = _safe_text(r.get("predecessor_ot", ""))
 
@@ -1832,12 +2164,16 @@ def render_scheduling_module(session, user):
                 st.dataframe(coactivity_df, use_container_width=True, hide_index=True)
 
             st.markdown("#### Actions manuelles à insérer")
+            st.caption("Ajoutez des actions libres (consignation, réunion, pause...) qui seront planifiées avec les OT. Cliquez sur **Sauvegarder** après édition.")
+
             actions_default = pd.DataFrame(
                 columns=["action_id", "slot_type", "description", "atelier", "duration_hours", "forced_start", "forced_team"]
             )
             if st.session_state["wizard_slot_actions_df"] is None:
                 st.session_state["wizard_slot_actions_df"] = actions_default
 
+            # BUG FIX #5: Show current saved state (not the live editor result) as the
+            # source of truth. A separate "Sauvegarder" button commits the edits.
             edited_actions = st.data_editor(
                 st.session_state["wizard_slot_actions_df"],
                 use_container_width=True,
@@ -1846,7 +2182,7 @@ def render_scheduling_module(session, user):
                 key="manual_actions_editor",
                 column_config={
                     "action_id": st.column_config.TextColumn("ID action"),
-                    "slot_type": st.column_config.SelectboxColumn("Type", options=["START", "END", "DURING"]),
+                    "slot_type": st.column_config.SelectboxColumn("Type planif.", options=["DURING", "START", "END"]),
                     "description": st.column_config.TextColumn("Description"),
                     "atelier": st.column_config.SelectboxColumn("Atelier", options=st.session_state.get("wizard_selected_ateliers", [])),
                     "duration_hours": st.column_config.NumberColumn("Durée (h)", min_value=0.0, step=0.5),
@@ -1854,7 +2190,33 @@ def render_scheduling_module(session, user):
                     "forced_team": st.column_config.TextColumn("Equipe forcée (code)"),
                 },
             )
-            st.session_state["wizard_slot_actions_df"] = edited_actions.copy()
+
+            # BUG FIX #5: Explicit save button — ensures state is persisted before generation
+            if st.button("💾 Sauvegarder les actions manuelles", key="save_manual_actions_btn"):
+                saved = edited_actions.copy()
+                # Strip fully empty rows
+                filled = saved[
+                    (saved.get("description", pd.Series([""] * len(saved))).astype(str).str.strip() != "") |
+                    (saved.get("atelier", pd.Series([""] * len(saved))).astype(str).str.strip() != "")
+                ].copy() if not saved.empty else saved
+                st.session_state["wizard_slot_actions_df"] = filled
+                n = len(filled)
+                st.markdown(
+                    f'<span class="mn-badge-success">✓ {n} action(s) sauvegardée(s)</span>',
+                    unsafe_allow_html=True,
+                )
+                print(f"[DEBUG] {n} action(s) manuelle(s) sauvegardée(s) en session_state.")
+            else:
+                # Always keep state in sync even without explicit save click
+                st.session_state["wizard_slot_actions_df"] = edited_actions.copy()
+
+            # Show count of currently saved actions
+            n_saved = len(st.session_state["wizard_slot_actions_df"])
+            if n_saved > 0:
+                st.markdown(
+                    f'<span class="mn-badge-orange">{n_saved} action(s) en attente de planification</span>',
+                    unsafe_allow_html=True,
+                )
 
             selected_ateliers = st.session_state.get("wizard_selected_ateliers", [])
             stop_hours = max(
@@ -1932,23 +2294,41 @@ def render_scheduling_module(session, user):
                     hide_index=True,
                 )
 
-                # ── Gantt chart ──────────────────────────────────────────────
-                st.subheader("Diagramme de Gantt")
-                _render_gantt(generated_df, planning)
+                # ── Gantt chart (Plotly interactif) ──────────────────────────
+                st.subheader("Diagramme de Gantt interactif")
+                _render_gantt(generated_df, planning, manual_df=manual_generated_df)
 
-                # ── PDF download ─────────────────────────────────────────────
-                try:
-                    pdf_bytes = _generate_planning_pdf(generated_df, planning)
-                    st.download_button(
-                        label="📥 Télécharger le planning PDF",
-                        data=pdf_bytes,
-                        file_name=f"planning_{planning.name.replace(' ', '_')}.pdf",
-                        mime="application/pdf",
-                        type="primary",
-                        use_container_width=True,
-                    )
-                except Exception as pdf_err:
-                    st.caption(f"PDF non disponible : {pdf_err}")
+                # ── Exports ───────────────────────────────────────────────────
+                st.subheader("Téléchargement")
+                dl_col1, dl_col2 = st.columns(2)
+
+                with dl_col1:
+                    try:
+                        pdf_bytes = _generate_planning_pdf(generated_df, planning)
+                        st.download_button(
+                            label="📄 Télécharger le planning PDF",
+                            data=pdf_bytes,
+                            file_name=f"planning_{_safe_key(planning.name)}.pdf",
+                            mime="application/pdf",
+                            use_container_width=True,
+                        )
+                    except Exception as pdf_err:
+                        st.error(f"Erreur PDF : {pdf_err}")
+                        import traceback
+                        st.caption(traceback.format_exc())
+
+                with dl_col2:
+                    try:
+                        html_bytes = _generate_planning_html(generated_df, planning, manual_df=manual_generated_df)
+                        st.download_button(
+                            label="🌐 Télécharger le planning HTML",
+                            data=html_bytes,
+                            file_name=f"planning_{_safe_key(planning.name)}.html",
+                            mime="text/html",
+                            use_container_width=True,
+                        )
+                    except Exception as html_err:
+                        st.error(f"Erreur HTML : {html_err}")
 
             if manual_generated_df is not None and not manual_generated_df.empty:
                 st.subheader("Actions manuelles planifiées")

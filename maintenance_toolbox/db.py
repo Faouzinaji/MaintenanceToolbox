@@ -291,6 +291,8 @@ class Planning(Base):
     end_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     daily_open: Mapped[str] = mapped_column(String(5), default="07:00")
     daily_close: Mapped[str] = mapped_column(String(5), default="15:00")
+    site_open: Mapped[str] = mapped_column(String(5), default="06:00")
+    site_close: Mapped[str] = mapped_column(String(5), default="22:00")
     status: Mapped[str] = mapped_column(String(32), default="draft")
     csv_filename: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     csv_bytes: Mapped[Optional[bytes]] = mapped_column(LargeBinary, nullable=True)
@@ -799,6 +801,8 @@ def _run_migrations() -> None:
         ("meeting_sessions", "invited_emails_json", "TEXT"),
         ("planning_tasks", "rex_actual_start", "VARCHAR(10)"),
         ("planning_tasks", "rex_actual_end", "VARCHAR(10)"),
+        ("plannings", "site_open", "VARCHAR(5)"),
+        ("plannings", "site_close", "VARCHAR(5)"),
     ]
     with engine.connect() as conn:
         for table, column, col_type in new_columns:
